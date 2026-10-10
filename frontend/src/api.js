@@ -382,14 +382,14 @@ export function deleteAdminScore(token, id) {
 }
 
 /** 流式聊天：POST /api/chat 并以 SSE 方式读取，逐条回调 onEvent({type,...}) */
-export async function chatStream(message, token, onEvent, conversationId = null) {
+export async function chatStream(message, token, onEvent, conversationId = null, mode = 'auto') {
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ message, conversation_id: conversationId }),
+    body: JSON.stringify({ message, conversation_id: conversationId, mode }),
   })
   if (!res.ok || !res.body) {
     throw new Error(`请求失败（${res.status}）`)

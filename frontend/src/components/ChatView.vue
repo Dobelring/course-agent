@@ -33,6 +33,7 @@ function fromHistory(m) {
       status: '完成',
     })),
     sources: m.retrieval_sources || null,
+    plan: m.plan || null,
     latency_ms: m.latency_ms,
     first_token_ms: m.first_token_ms,
   }
@@ -44,6 +45,20 @@ const TOOL_LABELS = {
   search_course_documents: '检索课程资料',
   list_my_documents: '查询课程资料列表',
   save_study_plan: '保存学习计划',
+  get_upcoming_assignments: '查询近期作业',
+  get_my_scores: '查询成绩',
+}
+
+const STEP_STATUS = {
+  pending: { icon: '○', label: '等待', cls: 'pending' },
+  running: { icon: '◉', label: '执行中', cls: 'running' },
+  done: { icon: '✓', label: '完成', cls: 'done' },
+  failed: { icon: '✗', label: '失败', cls: 'failed' },
+  skipped: { icon: '⊘', label: '跳过', cls: 'skipped' },
+}
+
+function stepMeta(status) {
+  return STEP_STATUS[status] || STEP_STATUS.pending
 }
 
 // 助手回答按 Markdown 渲染（表格/加粗/列表），DOMPurify 防 XSS
@@ -103,11 +118,30 @@ const SUGGESTIONS = [
   '帮我制定下周的学习计划',
 ]
 
+// 运行模式：auto=自动路由 / direct=单循环 / plan=规划执行
+const mode = ref('auto')
+const MODE_OPTIONS = [
+  { value: 'auto', label: '自动' },
+  { value: 'direct', label: '直接回答' },
+  { value: 'plan', label: '规划执行' },
+]
+
+function findStep(assistant, id) {
+  return assistant.plan?.steps?.find((s) => s.id === id)
+}
+
 async function doSend(text) {
   if (!text || busy.value) return
   error.value = ''
   messages.value.push({ role: 'user', content: text })
-  const assistant = ref({ role: 'assistant', content: '', tools: [] })
+  const assistant = ref({
+    role: 'assistant',
+    content: '',
+    tools: [],
+    plan: null,
+    mode: null,
+    notices: [],
+  })
   messages.value.push(assistant.value)
   busy.value = true
 
@@ -119,6 +153,53 @@ async function doSend(text) {
   try {
     await chatStream(text, props.token, (ev) => {
       switch (ev.type) {
+        case 'mode':
+          assistant.value.mode = ev.mode
+          break
+        case 'context':
+          if (ev.compressed) {
+            assistant.value.notices.push(`已将更早的 ${ev.summary_chars} 字历史压缩为摘要`)
+          }
+          break
+        case 'plan':
+          assistant.value.plan = { steps: ev.steps, revised: 0, degraded: false }
+          break
+        case 'step_start': {
+          const s = findStep(assistant.value, ev.id)
+          if (s) s.status = 'running'
+          break
+        }
+        case 'step_retry': {
+          const s = findStep(assistant.value, ev.id)
+          if (s) s.retries = (s.retries || 0) + 1
+          break
+        }
+        case 'step_end': {
+          const s = findStep(assistant.value, ev.id)
+          if (s) {
+            s.status = ev.status
+            s.result = ev.result
+            s.error = ev.error
+          }
+          break
+        }
+        case 'replan':
+          if (assistant.value.plan) {
+            assistant.value.plan.revised = ev.revised
+            // 替换后续步骤（保留已执行的历史）
+            const doneOrFailed = assistant.value.plan.steps.filter(
+              (s) => s.status !== 'pending',
+            )
+            assistant.value.plan.steps = [...doneOrFailed, ...ev.steps]
+            assistant.value.notices.push(`第 ${ev.revised} 次重规划：调整剩余步骤`)
+          }
+          break
+        case 'degraded':
+          assistant.value.notices.push(`⚠ ${ev.reason}`)
+          break
+        case 'fallback':
+          assistant.value.notices.push(`↩ 已降级为直接回答：${ev.reason}`)
+          break
         case 'tool_start':
           assistant.value.tools.push({ name: ev.name, status: '运行中' })
           break
@@ -134,13 +215,14 @@ async function doSend(text) {
         case 'done':
           assistant.value.latency_ms = ev.latency_ms
           assistant.value.first_token_ms = ev.first_token_ms
+          if (ev.plan) assistant.value.plan = ev.plan
           if (ev.conversation_id && currentConvId.value !== ev.conversation_id) {
             currentConvId.value = ev.conversation_id
             if (props.showHistory) loadConversations()
           }
           break
       }
-    }, currentConvId.value)
+    }, currentConvId.value, mode.value)
   } catch (e) {
     error.value = e.message
   } finally {
@@ -206,6 +288,30 @@ onMounted(() => {
           <div class="bubble">
             <template v-if="m.role === 'user'">{{ m.content }}</template>
             <template v-else>
+              <!-- 运行模式徽标 -->
+              <div v-if="m.mode" class="mode-badge">
+                {{ m.mode === 'plan' ? '📋 规划执行' : '💬 直接回答' }}
+              </div>
+              <!-- 规划步骤卡片 -->
+              <div v-if="m.plan && m.plan.steps && m.plan.steps.length" class="plan">
+                <div class="plan-head">
+                  执行计划
+                  <span v-if="m.plan.revised" class="plan-revised">已重规划 {{ m.plan.revised }} 次</span>
+                </div>
+                <div
+                  v-for="s in m.plan.steps"
+                  :key="s.id"
+                  class="plan-step"
+                  :class="stepMeta(s.status).cls"
+                >
+                  <span class="step-icon">{{ stepMeta(s.status).icon }}</span>
+                  <span class="step-title">{{ s.title }}</span>
+                  <span class="step-status">{{ stepMeta(s.status).label }}</span>
+                  <span v-if="s.retries" class="step-retries">重试 {{ s.retries }} 次</span>
+                </div>
+              </div>
+              <!-- 降级/压缩等过程提示 -->
+              <div v-for="(n, ni) in m.notices" :key="'n' + ni" class="notice">{{ n }}</div>
               <!-- 工具调用过程卡片（只显示中文名称与状态） -->
               <div v-for="(t, ti) in m.tools" :key="ti" class="tool">
                 <div class="tool-head">
@@ -222,7 +328,7 @@ onMounted(() => {
                 </div>
               </div>
               <div v-if="m.content" class="answer md" v-html="renderMd(m.content)"></div>
-              <div v-else-if="m.tools.length" class="thinking">正在组织回答…</div>
+              <div v-else-if="m.tools.length || (m.plan && m.plan.steps)" class="thinking">正在组织回答…</div>
               <div v-if="m.latency_ms" class="latency">
                 <template v-if="m.first_token_ms">首字 {{ (m.first_token_ms / 1000).toFixed(1) }} 秒 · </template>总耗时 {{ (m.latency_ms / 1000).toFixed(1) }} 秒
               </div>
@@ -234,6 +340,9 @@ onMounted(() => {
       <div class="composer">
         <p v-if="error" class="error">{{ error }}</p>
         <div class="row">
+          <select v-model="mode" class="mode-select" :disabled="busy" title="运行模式">
+            <option v-for="o in MODE_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
           <input
             v-model="input"
             placeholder="输入你的问题…"
@@ -421,6 +530,90 @@ onMounted(() => {
   margin-bottom: 8px;
   font-size: 12px;
 }
+
+.mode-badge {
+  display: inline-block;
+  font-size: 11px;
+  color: #6366f1;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 999px;
+  padding: 2px 10px;
+  margin-bottom: 8px;
+}
+
+.plan {
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.plan-head {
+  font-weight: 600;
+  color: #5b21b6;
+  margin-bottom: 6px;
+}
+
+.plan-revised {
+  font-weight: 400;
+  color: #b45309;
+  margin-left: 8px;
+  font-size: 11px;
+}
+
+.plan-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  color: #4c1d95;
+}
+
+.plan-step .step-icon {
+  width: 14px;
+  text-align: center;
+}
+
+.plan-step.done .step-icon { color: #16a34a; }
+.plan-step.running .step-icon { color: #2563eb; animation: pulse 1s infinite; }
+.plan-step.failed .step-icon { color: #dc2626; }
+.plan-step.skipped .step-icon { color: #9ca3af; }
+.plan-step.pending { color: #8b7fc7; }
+
+.step-title { flex: 1; }
+.step-status { font-size: 11px; opacity: 0.75; }
+.step-retries { font-size: 11px; color: #b45309; }
+
+@keyframes pulse {
+  50% { opacity: 0.35; }
+}
+
+.notice {
+  font-size: 12px;
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px dashed #fde68a;
+  border-radius: 8px;
+  padding: 5px 10px;
+  margin-bottom: 6px;
+}
+
+.mode-select {
+  flex-shrink: 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 0 8px;
+  height: 40px;
+  background: #fff;
+  font-size: 13px;
+  color: #374151;
+  outline: none;
+}
+
+.mode-select:disabled { opacity: 0.5; }
 
 .tool-head {
   display: flex;
