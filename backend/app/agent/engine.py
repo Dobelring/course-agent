@@ -1,4 +1,4 @@
-"""Agent 编排：连接 MCP 工具 + 强制绑定登录用户 + DeepSeek LLM。"""
+"""Agent 编排：连接 MCP 工具 + 强制绑定登录用户 + OpenAI 兼容 LLM（默认千问）。"""
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -80,12 +80,12 @@ def mcp_client_config() -> dict:
 
 
 def build_llm() -> ChatOpenAI:
-    if not settings.deepseek_api_key:
-        raise ValueError("未配置 DEEPSEEK_API_KEY，请在 backend/.env 中填写")
+    if not settings.llm_api_key:
+        raise ValueError("未配置 LLM_API_KEY，请在 backend/.env 中填写")
     return ChatOpenAI(
-        model=settings.deepseek_model,
-        api_key=settings.deepseek_api_key,
-        base_url=settings.deepseek_base_url,
+        model=settings.llm_model,
+        api_key=settings.llm_api_key,
+        base_url=settings.llm_base_url,
         temperature=0.3,
         streaming=True,
     )

@@ -1,6 +1,6 @@
 """pytest 全局夹具：独立测试库 + 演示数据，全程无需真实 API Key。
 
-重要：DATABASE_URL / DEEPSEEK_API_KEY 必须在导入任何 app.* 模块之前设置，
+重要：DATABASE_URL / LLM_API_KEY 必须在导入任何 app.* 模块之前设置，
 因此环境变量赋值放在本文件最顶部执行。
 """
 import os
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 _TEST_DB = Path(__file__).resolve().parent / "test_course_agent.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
 # 单元测试不依赖模型服务；/chat 的“未配置 Key”错误分支也依赖此状态
-os.environ["DEEPSEEK_API_KEY"] = ""
+os.environ["LLM_API_KEY"] = ""
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import bcrypt  # noqa: E402

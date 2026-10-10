@@ -24,7 +24,7 @@ flowchart LR
     subgraph 后端["FastAPI"]
         API[REST API<br/>JWT 鉴权 / 角色隔离]
         CHAT[SSE 流式聊天]
-        AGENT["LangChain Agent<br/>（DeepSeek）"]
+        AGENT["LangChain Agent<br/>（OpenAI 兼容 · 默认千问）"]
         MCP["MCP Server（stdio 子进程）<br/>6 个工具"]
         RAG["RAG 管线<br/>切片 → 向量化 → 余弦检索"]
         DB[("MySQL<br/>9 张业务表")]
@@ -73,11 +73,11 @@ flowchart LR
 
 ### 方式一：Docker Compose 一键启动（推荐）
 
-环境要求：Docker + 本机 MySQL 8 + DeepSeek API Key
+环境要求：Docker + 本机 MySQL 8 + 任意 OpenAI 兼容 LLM 的 API Key（默认千问）
 
 ```bash
-# 1. 项目根目录创建 .env，写入 API Key
-echo DEEPSEEK_API_KEY=sk-xxx > .env
+# 1. 项目根目录创建 .env，写入 API Key（默认接千问 DashScope 兼容模式）
+echo LLM_API_KEY=sk-xxx > .env
 
 # 2. 本机 MySQL 建库并创建容器访问账号
 mysql -uroot -p -e "CREATE DATABASE IF NOT EXISTS course_agent CHARACTER SET utf8mb4; CREATE USER IF NOT EXISTS 'course'@'%' IDENTIFIED BY '123456'; GRANT ALL PRIVILEGES ON course_agent.* TO 'course'@'%'; FLUSH PRIVILEGES;"
@@ -105,7 +105,7 @@ python -m venv .venv && .venv\Scripts\activate     # Windows
 pip install -r requirements.txt
 # 配置 backend/.env：
 #   DATABASE_URL=mysql+pymysql://root:密码@127.0.0.1:3306/course_agent?charset=utf8mb4
-#   DEEPSEEK_API_KEY=sk-xxx
+#   LLM_API_KEY=sk-xxx                   # 默认千问；换 DeepSeek 等只需改 LLM_BASE_URL/LLM_MODEL
 #   SEMESTER_START=2026-09-07          # 开学日期（用于推算教学周）
 python -m app.seed                   # 建表 + 演示数据
 python -m uvicorn app.main:app --port 8000
@@ -120,7 +120,7 @@ npm run dev                          # http://localhost:5173
 
 ## 技术栈
 
-Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · LangChain · MCP（FastMCP） · DeepSeek API · SSE · JWT
+Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · LangChain · MCP（FastMCP） · 千问 Qwen（OpenAI 兼容接口，可切换） · SSE · JWT
 
 ## 测试
 
@@ -151,7 +151,7 @@ python -m pytest tests/test_user_binding.py -v   # 单文件
 ```bash
 cd backend
 python scripts/eval.py retrieval   # 检索评测（离线，无需 Key）
-python scripts/eval.py tools       # 工具选择评测（需 DEEPSEEK_API_KEY）
+python scripts/eval.py tools       # 工具选择评测（需 LLM_API_KEY）
 python scripts/eval.py all         # 全部
 ```
 
@@ -167,4 +167,4 @@ python scripts/eval.py all         # 全部
 
 唯一失败样本（r26「性能计时和缓存这类横切关注点」期望命中《程序设计基础讲义》装饰器章节）暴露了纯向量检索在**查询与文档无词汇重合**时的语义鸿沟，是引入混合检索（BM25 + 向量）与重排（rerank）的直接依据——评测集刻意保留该 bad case 以量化改进空间。
 
-**工具选择评测**（需配置 `DEEPSEEK_API_KEY`）：对 12 条自然语言指令统计期望工具是否被调用，输出工具命中率。
+**工具选择评测**（需配置 `LLM_API_KEY`）：对 12 条自然语言指令统计期望工具是否被调用，输出工具命中率。

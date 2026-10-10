@@ -1,8 +1,8 @@
-r"""评测脚本：检索质量（离线）+ 工具选择准确率（需 DEEPSEEK_API_KEY）。
+r"""评测脚本：检索质量（离线）+ 工具选择准确率（需 LLM_API_KEY）。
 
 用法（backend 目录）：
     python scripts/eval.py retrieval      # 仅检索评测，无需 API Key
-    python scripts/eval.py tools          # 仅工具选择评测，需要 DEEPSEEK_API_KEY
+    python scripts/eval.py tools          # 仅工具选择评测，需要 LLM_API_KEY
     python scripts/eval.py all            # 两者都跑
 
 检索评测指标：Hit@1、Hit@3、MRR（基于 data/eval/eval_set.jsonl 黄金集）。
@@ -196,8 +196,8 @@ async def run_tool_eval() -> dict:
     from app.database import SessionLocal
     from app.models.user import User
 
-    if not settings.deepseek_api_key:
-        print("\n[跳过] 未配置 DEEPSEEK_API_KEY，工具选择评测需要真实模型。")
+    if not settings.llm_api_key:
+        print("\n[跳过] 未配置 LLM_API_KEY，工具选择评测需要真实模型。")
         print("       配置后执行：python scripts/eval.py tools")
         return {"skipped": True}
 

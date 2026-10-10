@@ -1,6 +1,6 @@
 # 一键启动全栈：FastAPI 后端 + nginx 前端（复用宿主机已有的 MySQL）
 # 用法：
-#   1. 在本文件同目录创建 .env，写入 DEEPSEEK_API_KEY=sk-xxx
+#   1. 在本文件同目录创建 .env，写入 LLM_API_KEY=sk-xxx（默认千问，见 backend/.env.example）
 #   2. 确保本机 MySQL 已运行，且已建库 course_agent 与用户 course（见 README）
 #   3. docker compose up -d --build
 #   4. 访问 http://localhost:5173
@@ -10,7 +10,9 @@ services:
     environment:
       # host.docker.internal = 宿主机；容器后端直接使用本机 MySQL，与本地开发共用同一份数据
       DATABASE_URL: mysql+pymysql://course:123456@host.docker.internal:3306/course_agent?charset=utf8mb4
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       SEMESTER_START: ${SEMESTER_START:-2026-09-07}
     volumes:

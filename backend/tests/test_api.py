@@ -189,7 +189,7 @@ def test_chat_without_api_key_returns_sse_error(client, seeded, auth_headers):
     assert resp.headers["content-type"].startswith("text/event-stream")
     # 流的第一段应是结构化错误事件，而不是 500 / 崩溃
     assert '"type": "error"' in resp.text
-    assert "DEEPSEEK_API_KEY" in resp.text
+    assert "LLM_API_KEY" in resp.text
 
 
 # ---------- SSE 检索溯源解析 ----------
