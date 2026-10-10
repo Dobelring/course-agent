@@ -138,16 +138,16 @@ export function fetchConversations(token) {
   return request('/api/conversations', { headers: { Authorization: `Bearer ${token}` } })
 }
 
-export function createConversation(token, title = '新对话') {
-  return request('/api/conversations', {
-    method: 'POST',
+export function fetchConversation(token, id) {
+  return request(`/api/conversations/${id}`, { headers: { Authorization: `Bearer ${token}` } })
+}
+
+export function renameConversation(token, id, title) {
+  return request(`/api/conversations/${id}`, {
+    method: 'PATCH',
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ title }),
   })
-}
-
-export function fetchConversation(token, id) {
-  return request(`/api/conversations/${id}`, { headers: { Authorization: `Bearer ${token}` } })
 }
 
 export function deleteConversation(token, id) {

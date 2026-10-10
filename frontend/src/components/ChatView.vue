@@ -6,10 +6,10 @@ import DOMPurify from 'dompurify'
 import {
   cancelRun,
   chatStream,
-  createConversation,
   deleteConversation,
   fetchConversation,
   fetchConversations,
+  renameConversation,
   resolveApproval,
 } from '../api'
 
@@ -25,6 +25,21 @@ const error = ref('')
 const conversations = ref([])
 const currentConvId = ref(null)
 const currentRunId = ref(null) // 当前生成的 run_id，用于中途取消
+// 输入草稿按会话隔离：key 为会话 id 字符串，'new' 表示「新对话」未发送状态。
+// 切换会话时保存当前草稿并恢复目标草稿——输入的内容只属于它所在会话。
+const drafts = ref({})
+
+function draftKey() {
+  return currentConvId.value == null ? 'new' : String(currentConvId.value)
+}
+
+function saveDraft() {
+  drafts.value[draftKey()] = input.value
+}
+
+function restoreDraft() {
+  input.value = drafts.value[draftKey()] ?? ''
+}
 
 function fromHistory(m) {
   if (m.role === 'user') return { role: 'user', content: m.content }
@@ -104,22 +119,22 @@ async function loadConversations() {
 
 async function newConversation() {
   if (busy.value) return
-  try {
-    const conv = await createConversation(props.token)
-    currentConvId.value = conv.id
-    messages.value = []
-    await loadConversations()
-  } catch (e) {
-    ElMessage.error(e.message)
-  }
+  // 懒创建：不立即建会话——发送首条消息时后端才创建。
+  // 「点了新对话但没发消息」不会在侧栏留下空白会话，切换走自然无残留。
+  saveDraft()
+  currentConvId.value = null
+  messages.value = []
+  restoreDraft()
 }
 
 async function openConversation(id) {
   if (busy.value) return
+  saveDraft() // 当前会话的未发送草稿留存
   try {
     const conv = await fetchConversation(props.token, id)
     currentConvId.value = conv.id
     messages.value = conv.messages.map(fromHistory)
+    restoreDraft() // 目标会话的草稿恢复（没有则输入框为空白）
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -128,13 +143,32 @@ async function openConversation(id) {
 async function removeConversation(id) {
   try {
     await deleteConversation(props.token, id)
+    delete drafts.value[String(id)]
     if (currentConvId.value === id) {
       currentConvId.value = null
       messages.value = []
+      restoreDraft()
     }
     await loadConversations()
   } catch (e) {
     ElMessage.error(e.message)
+  }
+}
+
+// 重命名会话：弹输入框预填当前标题，成功后就地更新侧栏
+async function renameConv(c) {
+  try {
+    const { value } = await ElMessageBox.prompt('输入新的对话名称', '重命名对话', {
+      inputValue: c.title,
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputValidator: (v) => (v && v.trim() ? true : '名称不能为空'),
+    })
+    const updated = await renameConversation(props.token, c.id, value.trim())
+    c.title = updated.title
+    ElMessage.success('已重命名')
+  } catch {
+    /* 用户取消或校验失败，忽略 */
   }
 }
 
@@ -205,6 +239,12 @@ async function doSend(text) {
         case 'step_start': {
           const s = findStep(assistant.value, ev.id)
           if (s) s.status = 'running'
+          break
+        }
+        case 'step_text': {
+          // 步骤执行中的流式输出：实时挂到对应步骤卡片（保留尾部，防止无限增长）
+          const s = findStep(assistant.value, ev.id)
+          if (s) s.live = ((s.live || '') + ev.delta).slice(-400)
           break
         }
         case 'step_retry': {
@@ -288,6 +328,7 @@ function send() {
   const text = input.value.trim()
   if (!text || busy.value) return
   input.value = ''
+  delete drafts.value[draftKey()] // 草稿已随消息发出，清除
   doSend(text)
 }
 
@@ -311,7 +352,16 @@ onMounted(() => {
         @click="openConversation(c.id)"
       >
         <div class="conv-title">{{ c.title }}</div>
-        <div class="conv-meta">{{ c.msg_count }} 条消息</div>
+        <div class="conv-meta">{{ c.msg_count }} 条回复</div>
+        <el-button
+          class="conv-ren"
+          size="small"
+          text
+          title="重命名"
+          @click.stop="renameConv(c)"
+        >
+          ✎
+        </el-button>
         <el-button
           class="conv-del"
           size="small"
@@ -361,6 +411,8 @@ onMounted(() => {
                   <span class="step-title">{{ s.title }}</span>
                   <span class="step-status">{{ stepMeta(s.status).label }}</span>
                   <span v-if="s.retries" class="step-retries">重试 {{ s.retries }} 次</span>
+                  <!-- 步骤执行中的流式输出（实时吐字） -->
+                  <span v-if="s.live" class="step-live">{{ s.live }}</span>
                 </div>
               </div>
               <!-- 降级/压缩等过程提示 -->
@@ -470,7 +522,7 @@ onMounted(() => {
   font-size: 13px;
   font-weight: 500;
   color: #1f2937;
-  padding-right: 40px;
+  padding-right: 70px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -480,6 +532,13 @@ onMounted(() => {
   font-size: 11px;
   color: #9ca3af;
   margin-top: 2px;
+}
+
+/* 重命名在删除左侧，两个按钮都停靠右上 */
+.conv-ren {
+  position: absolute;
+  right: 44px;
+  top: 2px;
 }
 
 .conv-del {
@@ -628,6 +687,7 @@ onMounted(() => {
 .plan-step {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 3px 0;
   color: #4c1d95;
@@ -647,6 +707,17 @@ onMounted(() => {
 .step-title { flex: 1; }
 .step-status { font-size: 11px; opacity: 0.75; }
 .step-retries { font-size: 11px; color: #b45309; }
+
+/* 步骤执行中的流式输出：占满整行、灰色小字、超长隐藏 */
+.step-live {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: #6b7280;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 3.6em;
+  overflow: hidden;
+}
 
 @keyframes pulse {
   50% { opacity: 0.35; }
