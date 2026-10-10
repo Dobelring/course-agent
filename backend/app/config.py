@@ -36,5 +36,14 @@ class Settings(BaseSettings):
     # 学期第一周的周一日期（用于推算当前教学周）
     semester_start: str = "2026-09-07"
 
+    # Agent 行为调优（可通过 .env 覆盖）
+    # 上下文预算：历史总字符超过 max 时，旧消息压缩为摘要，仅保留最近 keep 字符原文
+    agent_history_max_chars: int = 8000
+    agent_history_keep_recent_chars: int = 3000
+    # 规划执行：单次任务最多拆解步骤数、单步 LLM/工具重试次数、失败后最多重规划次数
+    agent_max_steps: int = 5
+    agent_step_retries: int = 2
+    agent_max_replans: int = 2
+
 
 settings = Settings()
