@@ -14,10 +14,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
-from app.agent.planner import Plan, PlanStep, replan as replan_llm
+from app.agent.approval import ApprovalDenied
+from app.agent.planner import Plan, PlanStep, renumber_steps, replan as replan_llm
 from app.agent.resilience import retry_async
 
 
@@ -51,6 +53,7 @@ class ExecutionResult:
     success: bool                    # 是否有至少一个步骤成功产出
     plan: Plan
     degraded: bool = False           # 是否发生了降级（重规划耗尽/综合回退）
+    user_denied: bool = False        # 全部步骤被用户拒绝（区别于系统降级）
     error: str | None = None
     steps_done: int = 0
     steps_failed: int = 0
@@ -128,26 +131,28 @@ async def execute_plan(
     max_replans: int = 2,
     emit: EmitFn = _noop_emit,
 ) -> ExecutionResult:
-    """执行计划直到无 pending 步骤；返回综合后的执行结果。"""
+    """执行计划：每轮取「就绪批次」（前置全部完成的 pending 步骤）并发执行。
+
+    - 并行度由步骤依赖决定：depends_on 为空即就绪；批次内 asyncio.gather 并发
+    - 批次内任一步骤失败 → 批次结束后统一重规划（替代旧的逐失败重规划）
+    - 依赖失败/被拒的后续步骤标记 skipped（不无限等待，不死循环）
+    - 用户拒绝（ApprovalDenied）→ skipped 且不计入重规划
+    """
     await emit({"type": "plan", "steps": [s.to_dict() for s in plan.steps]})
     replans_used = 0
 
-    while True:
-        step = next((s for s in plan.steps if s.status == "pending"), None)
-        if step is None:
-            break
-
+    async def _run_one(step: PlanStep) -> None:
         step.status = "running"
         await emit({"type": "step_start", "id": step.id, "title": step.title,
                     "goal": step.goal, "tool_hint": step.tool_hint,
-                    "total": sum(1 for s in plan.steps if s.status in
-                                 ("pending", "running", "done", "failed"))})
-
+                    "depends_on": list(step.depends_on),
+                    "total": len(plan.steps)})
         try:
             result = await retry_async(
                 lambda s=step: run_step(s),
                 retries=step_retries,
                 base_delay=0.5,
+                no_retry=(ApprovalDenied,),
                 on_retry=lambda n, e, _id=step.id: _emit_retry_sync(emit, _id, n, e),
             )
             if not str(result).strip():
@@ -156,42 +161,85 @@ async def execute_plan(
             step.result = str(result).strip()
             await emit({"type": "step_end", "id": step.id, "status": "done",
                         "result": step.result[:500]})
+        except ApprovalDenied as exc:
+            # 用户主动拒绝：标记 skipped，不算失败、不触发重规划
+            step.status = "skipped"
+            step.error = str(exc) or "用户拒绝执行"
+            await emit({"type": "step_end", "id": step.id, "status": "skipped",
+                        "error": step.error})
         except Exception as exc:  # noqa: BLE001
             step.status = "failed"
             step.error = f"{type(exc).__name__}: {exc}"
             await emit({"type": "step_end", "id": step.id, "status": "failed",
                         "error": step.error})
 
-            # 结构化故障 → 重规划
-            if replans_used >= max_replans:
-                await emit({"type": "degraded",
-                            "reason": f"重规划次数已用尽（{max_replans}），停止执行剩余步骤"})
-                _skip_pending(plan)
-                break
-            replans_used += 1
-            try:
-                new_steps = await replan_llm(llm, query, plan, tools, max_steps=len(plan.steps))
-            except Exception as replan_exc:  # noqa: BLE001 — 重规划失败直接降级
-                await emit({"type": "degraded",
-                            "reason": f"重规划失败：{type(replan_exc).__name__}: {replan_exc}"})
-                _skip_pending(plan)
-                break
-            # 用新步骤替换全部 pending（失败步骤保留作记录）
-            plan.steps = [s for s in plan.steps if s.status != "pending"] + new_steps
-            plan.revised += 1
-            await emit({"type": "replan", "revised": plan.revised,
-                        "steps": [s.to_dict() for s in new_steps]})
+    while True:
+        pending = plan.pending
+        if not pending:
+            break
+        by_id = {s.id: s for s in plan.steps}
+        ready = [
+            s for s in pending
+            if all(d in by_id and by_id[d].status == "done" for d in s.depends_on)
+        ]
+
+        if not ready:
+            # 无就绪步骤 ⟹ 所有 pending 的前置都已失败/被拒 → 阻塞跳过（保证终止）
+            for s in pending:
+                s.status = "skipped"
+                s.error = "前置步骤未完成"
+                await emit({"type": "step_end", "id": s.id, "status": "skipped",
+                            "error": s.error})
+            continue
+
+        # 就绪批次并发执行（批次内步骤互不依赖）
+        if len(ready) == 1:
+            await _run_one(ready[0])
+        else:
+            await asyncio.gather(*[_run_one(s) for s in ready])
+
+        # 批次结束统一处理失败 → 重规划（一次批次最多触发一次）
+        if not any(s.status == "failed" for s in ready):
+            continue
+        if replans_used >= max_replans:
+            await emit({"type": "degraded",
+                        "reason": f"重规划次数已用尽（{max_replans}），停止执行剩余步骤"})
+            _skip_pending(plan)
+            break
+        replans_used += 1
+        try:
+            new_steps = await replan_llm(llm, query, plan, tools,
+                                         max_steps=len(plan.steps))
+        except Exception as replan_exc:  # noqa: BLE001 — 重规划失败直接降级
+            await emit({"type": "degraded",
+                        "reason": f"重规划失败：{type(replan_exc).__name__}: {replan_exc}"})
+            _skip_pending(plan)
+            break
+        # id 整体平移，避免与历史步骤冲突（前端按 id 关联事件）
+        max_id = max(s.id for s in plan.steps)
+        new_steps = renumber_steps(new_steps, max_id)
+        plan.steps = [s for s in plan.steps if s.status != "pending"] + new_steps
+        plan.revised += 1
+        await emit({"type": "replan", "revised": plan.revised,
+                    "steps": [s.to_dict() for s in new_steps]})
 
     done_count = sum(1 for s in plan.steps if s.status == "done")
+    denied = [s for s in plan.steps
+              if s.status == "skipped" and s.error and "拒绝" in s.error]
     failed_count = sum(1 for s in plan.steps if s.status in ("failed", "skipped"))
+    # 用户拒绝不算降级；降级只看重规划耗尽或非拒绝原因的跳过
     degraded = replans_used >= max_replans or any(
-        s.status == "skipped" for s in plan.steps
+        s.status == "skipped" and s not in denied for s in plan.steps
     )
 
     if done_count == 0:
         first_error = next((s.error for s in plan.steps if s.error), None)
+        user_denied = bool(denied) and len(denied) == sum(
+            1 for s in plan.steps if s.status == "skipped")
         return ExecutionResult(
-            answer="", success=False, plan=plan, degraded=True,
+            answer="", success=False, plan=plan,
+            degraded=not user_denied,
+            user_denied=user_denied,
             error=first_error or "所有步骤均未成功",
             steps_done=0, steps_failed=failed_count,
         )

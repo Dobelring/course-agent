@@ -31,14 +31,16 @@ class PlanStep:
     title: str                 # 步骤标题（给用户看）
     goal: str                  # 执行目标（给执行器看）
     tool_hint: str | None = None   # 建议工具（执行器可参考，不强制）
-    status: str = "pending"    # pending / running / done / failed
+    depends_on: list[int] = field(default_factory=list)  # 前置步骤 id（空 = 可立即执行/并行）
+    status: str = "pending"    # pending / running / done / failed / skipped
     result: str | None = None  # 执行结果摘要
     error: str | None = None   # 失败原因（replan 的输入）
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "goal": self.goal,
-            "tool_hint": self.tool_hint, "status": self.status,
+            "tool_hint": self.tool_hint, "depends_on": self.depends_on,
+            "status": self.status,
             "result": self.result, "error": self.error,
         }
 
@@ -77,10 +79,13 @@ PLAN_PROMPT = """你是任务规划器。把用户目标拆解为 {max_steps} �
 要求：
 - 每步是一个独立可验证的执行单元，goal 具体明确
 - tool_hint 填最可能用到的工具名（从可用工具选），没有则 null
-- 最后一步通常是综合产出（回答/保存）
+- depends_on 填该步骤的前置步骤 id 列表（1 起始）；无依赖填 []（可与其他步骤并行）
+  只有存在数据依赖时才设依赖——例如「分析成绩」必须等「查成绩」完成；
+  「查课表」和「查成绩」互不依赖应填 []
+- 最后一步通常是综合产出（回答/保存），依赖所有信息收集步骤
 
 只输出 JSON：
-{{"steps": [{{"title": "<短标题>", "goal": "<具体目标>", "tool_hint": "<工具名或null>"}}]}}
+{{"steps": [{{"title": "<短标题>", "goal": "<具体目标>", "tool_hint": "<工具名或null>", "depends_on": [<前置id>...]}}]}}
 
 用户目标：{query}"""
 
@@ -98,10 +103,11 @@ REPLAN_PROMPT = """执行计划时有步骤失败，请修订剩余计划。
 要求：
 - 保留仍然有效的剩余步骤，替换/绕开失败部分
 - 若失败源于工具不存在，换用其他工具或降级为直接回答
+- depends_on 用**新列表中的 id**（1 起始）表达依赖；互不依赖的步骤填 [] 以并行
 - 步骤总数不超过 {max_steps}
 
 只输出 JSON：
-{{"steps": [{{"title": "<短标题>", "goal": "<具体目标>", "tool_hint": "<工具名或null>"}}]}}"""
+{{"steps": [{{"title": "<短标题>", "goal": "<具体目标>", "tool_hint": "<工具名或null>", "depends_on": [<前置id>...]}}]}}"""
 
 
 # ---------------------------------------------------------------------------
@@ -146,12 +152,39 @@ def parse_plan(data: dict) -> list[PlanStep]:
         if not isinstance(s, dict) or not s.get("goal"):
             raise ValueError(f"第 {i} 步缺少 goal")
         hint = s.get("tool_hint")
+        # 依赖语义（兼容旧输出）：
+        # - 未提供 depends_on（或 null）→ 默认串行：依赖上一步（保持原行为）
+        # - 显式 [] → 无前置，可并行
+        # - 显式列表 → 只允许引用更早的 id（di < i），结构上不可能成环（DAG 由构造保证）
+        raw_deps = s.get("depends_on")
+        if raw_deps is None:
+            deps = [i - 1] if i > 1 else []
+        elif isinstance(raw_deps, list):
+            deps = []
+            for d in raw_deps:
+                try:
+                    di = int(d)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= di < i and di not in deps:
+                    deps.append(di)
+        else:
+            deps = [i - 1] if i > 1 else []
         steps.append(PlanStep(
             id=i,
             title=str(s.get("title") or f"步骤{i}"),
             goal=str(s["goal"]),
             tool_hint=None if hint in (None, "null", "") else str(hint),
+            depends_on=deps,
         ))
+    return steps
+
+
+def renumber_steps(steps: list[PlanStep], max_existing_id: int) -> list[PlanStep]:
+    """重规划后把新步骤 id 整体平移，避免与历史步骤 id 冲突（依赖同步平移）。"""
+    for i, s in enumerate(steps, 1):
+        s.depends_on = [max_existing_id + d for d in s.depends_on]
+        s.id = max_existing_id + i
     return steps
 
 
