@@ -159,6 +159,11 @@ def my_stats(
     pending_assignments = pending_q.count()
     next_due = pending_q.order_by(Assignment.due_at).first()
 
+    # Token/成本聚合（UsageCollector 落库字段）
+    total_input = sum(m.input_tokens or 0 for m in assistant_msgs)
+    total_output = sum(m.output_tokens or 0 for m in assistant_msgs)
+    total_cost = round(sum(m.cost_cny or 0 for m in assistant_msgs), 6)
+
     return {
         "conversations": len(conv_ids),
         "messages": messages,
@@ -166,6 +171,9 @@ def my_stats(
         "tool_distribution": tool_dist,
         "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
         "avg_first_token_ms": round(sum(first_tokens) / len(first_tokens)) if first_tokens else None,
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_cost_cny": total_cost,
         "documents": db.query(func.count(CourseDocument.id))
         .filter(CourseDocument.user_id == current_user.id)
         .scalar()

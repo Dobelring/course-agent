@@ -37,6 +37,9 @@ function fromHistory(m) {
     plan: m.plan || null,
     latency_ms: m.latency_ms,
     first_token_ms: m.first_token_ms,
+    usage: m.input_tokens != null
+      ? { input_tokens: m.input_tokens, output_tokens: m.output_tokens, cost_cny: m.cost_cny }
+      : null,
   }
 }
 
@@ -247,6 +250,7 @@ async function doSend(text) {
           assistant.value.latency_ms = ev.latency_ms
           assistant.value.first_token_ms = ev.first_token_ms
           if (ev.plan) assistant.value.plan = ev.plan
+          if (ev.usage) assistant.value.usage = ev.usage
           if (ev.conversation_id && currentConvId.value !== ev.conversation_id) {
             currentConvId.value = ev.conversation_id
             if (props.showHistory) loadConversations()
@@ -361,7 +365,7 @@ onMounted(() => {
               <div v-if="m.content" class="answer md" v-html="renderMd(m.content)"></div>
               <div v-else-if="m.tools.length || (m.plan && m.plan.steps)" class="thinking">正在组织回答…</div>
               <div v-if="m.latency_ms" class="latency">
-                <template v-if="m.first_token_ms">首字 {{ (m.first_token_ms / 1000).toFixed(1) }} 秒 · </template>总耗时 {{ (m.latency_ms / 1000).toFixed(1) }} 秒
+                <template v-if="m.first_token_ms">首字 {{ (m.first_token_ms / 1000).toFixed(1) }} 秒 · </template>总耗时 {{ (m.latency_ms / 1000).toFixed(1) }} 秒<template v-if="m.usage && m.usage.total_tokens"> · {{ m.usage.total_tokens }} tokens · ¥{{ (m.usage.cost_cny || 0).toFixed(4) }}</template>
               </div>
             </template>
           </div>

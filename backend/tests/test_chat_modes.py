@@ -62,8 +62,9 @@ def fake_agent_env(monkeypatch):
     from app.api import chat as chat_mod
 
     fake_llm = FakeLLM()
-    monkeypatch.setattr(chat_mod, "build_llm", lambda: fake_llm)
-    monkeypatch.setattr(chat_mod, "build_agent", lambda user, tools, extra_system="": FakeAgent())
+    monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
+    monkeypatch.setattr(chat_mod, "build_agent",
+                        lambda user, tools, extra_system="", llm=None: FakeAgent())
     return fake_llm
 
 

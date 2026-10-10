@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from loguru import logger
 from pydantic import BaseModel
 
 from app.agent.approval import (
@@ -37,6 +38,7 @@ from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_confi
 from app.agent.planner import Plan, PlanStep, classify_complexity, create_plan
 from app.agent.plan_executor import ExecutionResult, execute_plan
 from app.agent.resilience import retry_async
+from app.agent.usage import UsageCollector
 from app.config import settings
 from app.core.security import get_current_user
 from app.database import SessionLocal
@@ -125,9 +127,14 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
         started_at = time.perf_counter()
         first_token_ms = None  # 第一个字输出时的耗时
         task: asyncio.Task | None = None
+        # 用量收集器：挂在 LLM 实例上，覆盖分类/规划/步骤/综合全部调用
+        usage = UsageCollector(
+            price_input_per_m=settings.llm_price_input_per_m,
+            price_output_per_m=settings.llm_price_output_per_m,
+        )
         # 提前校验 Key 配置，失败直接返回错误事件
         try:
-            llm = build_llm()
+            llm = build_llm(usage)
         except ValueError as e:
             yield _sse({"type": "error", "message": str(e)})
             return
@@ -217,7 +224,18 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                 n.strip() for n in settings.agent_approval_tools.split(",") if n.strip()
             }
             tools = gate_write_tools(tools, approval, approval_names)
-            agent = build_agent(current_user, tools, extra_system=ctx.summary_block)
+            # 三级记忆注入：会话摘要 + 跨会话用户画像
+            from app.agent.memory import maybe_refresh_profile, profile_block
+            from app.models.memory import UserMemory as _UserMemory
+
+            profile_row = (
+                db.query(_UserMemory).filter(_UserMemory.user_id == current_user.id).first()
+            )
+            extra_system = "\n\n".join(
+                part for part in (ctx.summary_block, profile_block(profile_row.profile if profile_row else None))
+                if part
+            )
+            agent = build_agent(current_user, tools, extra_system=extra_system, llm=llm)
 
             # 同一工具在包装层与底层各触发一次事件，只向前端展示第一组
             def _fresh_sets() -> tuple[set, set]:
@@ -411,6 +429,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
 
             answer = "".join(collected_text)
             latency = int((time.perf_counter() - started_at) * 1000)
+            usage_dict = usage.to_dict()
             # 保存对话历史
             db.add(AiMessage(conversation_id=conversation.id, role="user", content=payload.message))
             db.add(
@@ -428,6 +447,9 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     ),
                     latency_ms=latency,
                     first_token_ms=first_token_ms,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost_cny=usage.cost_cny,
                 )
             )
             db.commit()
@@ -440,8 +462,21 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     "mode": result["mode_used"] if result else mode_used,
                     "degraded": result["degraded"] if result else degraded,
                     "plan": result["plan_meta"] if result else plan_meta,
+                    "usage": usage_dict,
                 }
             )
+            # 跨会话画像刷新：节流（每 N 条触发）+ best-effort，放在 done 之后不拖尾延迟
+            try:
+                await maybe_refresh_profile(
+                    llm, db, current_user.id,
+                    _history_to_dicts(history_rows) + [
+                        {"role": "user", "content": payload.message},
+                        {"role": "assistant", "content": answer},
+                    ],
+                    every=settings.memory_refresh_every,
+                )
+            except Exception:  # noqa: BLE001 — 画像失败绝不影响已完成的对话
+                logger.warning("画像刷新异常", exc_info=True)
         except Exception as e:  # noqa: BLE001
             yield _sse({"type": "error", "message": f"服务异常：{e}"})
         finally:

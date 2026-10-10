@@ -92,6 +92,9 @@ def get_conversation(
                 "retrieval_sources": json.loads(m.retrieval_sources) if m.retrieval_sources else None,
                 "plan": json.loads(m.plan) if m.plan else None,
                 "latency_ms": m.latency_ms,
+                "input_tokens": m.input_tokens,
+                "output_tokens": m.output_tokens,
+                "cost_cny": m.cost_cny,
                 "created_at": str(m.created_at),
             }
             for m in msgs
