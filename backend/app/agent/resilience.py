@@ -22,6 +22,7 @@ async def retry_async(
     max_delay: float = 8.0,
     jitter: float = 0.3,
     retry_on: Sequence[type[BaseException]] = (Exception,),
+    no_retry: Sequence[type[BaseException]] = (),
     on_retry: Callable[[int, BaseException], None] | None = None,
 ) -> T:
     """执行 ``fn``（无参协程工厂），失败则指数退避后重试。
@@ -31,12 +32,15 @@ async def retry_async(
     :param max_delay:   单次退避上限（秒）
     :param jitter:      抖动比例，实际延迟在 [d*(1-j), d*(1+j)] 内随机
     :param retry_on:    可重试异常类型；其余异常直接抛出
+    :param no_retry:    绝不重试的异常类型（优先于 retry_on），如用户拒绝
     :param on_retry:    每次决定重试时的回调（attempt 从 1 计），用于打日志/打点
     """
     attempt = 0
     while True:
         try:
             return await fn()
+        except tuple(no_retry):
+            raise  # 用户决策类异常：重试只会重复打扰用户
         except tuple(retry_on) as exc:
             if attempt >= retries:
                 raise

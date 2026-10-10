@@ -1,24 +1,37 @@
 """聊天接口：Agent 运行过程通过 SSE 实时推送到前端，结束后落库对话历史。
 
+架构：模式执行（direct/plan）跑在后台任务里，事件统一写入 asyncio.Queue，
+生成器只负责 drain 队列转发 SSE。这样写操作审批（ApprovalContext）发生在
+工具执行深处时，approval_required 事件仍能实时送达前端，决策由另一条
+HTTP 请求（/chat/approvals/{id}）解开 Future。
+
 模式（payload.mode）：
-- auto    先用轻量分类判断复杂度，复杂走规划执行、简单走单循环
-- direct  强制单循环（create_agent，ReAct 式工具调用）
-- plan    强制规划执行：拆解 → 逐步执行（重试）→ 失败重规划 → 综合
+- auto    轻量分类路由：简单走单循环，复杂走 Plan-and-Execute
+- direct  强制单循环
+- plan    强制规划执行（拆解 → 并发就绪批次 → 重规划 → 综合）
 
 SSE 事件：mode / context / plan / step_start / step_text / step_retry /
-step_end / replan / degraded / fallback / tool_start / tool_end / text / error / done
+step_end / replan / degraded / fallback / approval_required /
+approval_resolved / tool_start / tool_end / text / error / done
 """
 import asyncio
 import json
 import time
-from typing import AsyncIterator, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel
 
+from app.agent.approval import (
+    ApprovalContext,
+    ApprovalDenied,
+    current_step_id,
+    decide,
+    gate_write_tools,
+)
 from app.agent.context import ContextPlan, build_context, split_history
 from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_config, pretty_tool_name
 from app.agent.planner import Plan, PlanStep, classify_complexity, create_plan
@@ -39,6 +52,10 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: int | None = None
     mode: Literal["auto", "direct", "plan"] = "auto"
+
+
+class ApprovalDecision(BaseModel):
+    approve: bool
 
 
 def _sse(obj: dict) -> str:
@@ -88,11 +105,26 @@ def _history_to_dicts(rows) -> list[dict]:
     ]
 
 
+@router.post("/approvals/{approval_id}")
+async def resolve_approval(
+    approval_id: str,
+    payload: ApprovalDecision,
+    current_user: User = Depends(get_current_user),
+):
+    """写操作审批决策：由 SSE 流的消费方在弹窗确认/拒绝后调用。"""
+    err = decide(approval_id, payload.approve, current_user.id)
+    if err:
+        status = 404 if "不存在" in err else 403
+        raise HTTPException(status_code=status, detail=err)
+    return {"ok": True, "approved": payload.approve}
+
+
 @router.post("")
 async def chat(payload: ChatRequest, current_user: User = Depends(get_current_user)):
     async def gen():
         started_at = time.perf_counter()
         first_token_ms = None  # 第一个字输出时的耗时
+        task: asyncio.Task | None = None
         # 提前校验 Key 配置，失败直接返回错误事件
         try:
             llm = build_llm()
@@ -171,16 +203,29 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                 for m in ctx.messages
             ]
             agent_input = {"messages": history_msgs + [HumanMessage(content=payload.message)]}
+
+            # ---------- 事件队列：模式执行与审批事件的统一出口 ----------
+            event_queue: asyncio.Queue = asyncio.Queue()
+
+            async def sink(evt: dict) -> None:
+                await event_queue.put(evt)
+
+            approval = ApprovalContext(
+                sink, timeout=settings.agent_approval_timeout, user_id=current_user.id,
+            )
+            approval_names = {
+                n.strip() for n in settings.agent_approval_tools.split(",") if n.strip()
+            }
+            tools = gate_write_tools(tools, approval, approval_names)
             agent = build_agent(current_user, tools, extra_system=ctx.summary_block)
 
-            # ---------- 工具事件转发（单循环与规划步骤共用） ----------
+            # 同一工具在包装层与底层各触发一次事件，只向前端展示第一组
             def _fresh_sets() -> tuple[set, set]:
-                # 同一工具在包装层与底层各触发一次事件，只展示第一组
                 return set(), set()
 
             async def forward_tool_events(
-                events: AsyncIterator, started: set, ended: set, step_id: int | None = None
-            ) -> AsyncIterator[dict]:
+                events, started: set, ended: set, step_id: int | None = None
+            ):
                 """从 astream_events 流中提取工具事件并打标（step_id 可空）。"""
                 async for event in events:
                     etype = event.get("event")
@@ -218,10 +263,9 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     else:
                         yield {"_raw": event}  # 交由调用方处理文本流
 
-            # ---------- direct：单循环 ----------
-            async def direct_loop() -> AsyncIterator[str]:
+            # ---------- direct：单循环（事件入队，由生成器 drain） ----------
+            async def run_direct() -> None:
                 started, ended = _fresh_sets()
-                nonlocal first_token_ms
                 async for ev in forward_tool_events(
                     agent.astream_events(agent_input, version="v2"), started, ended
                 ):
@@ -231,63 +275,53 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                             chunk = event["data"].get("chunk")
                             content = chunk.content if chunk else None
                             if isinstance(content, str) and content:
-                                if first_token_ms is None:
-                                    first_token_ms = int((time.perf_counter() - started_at) * 1000)
-                                collected_text.append(content)
-                                yield _sse({"type": "text", "delta": content})
+                                await sink({"type": "text", "delta": content})
                     else:
-                        yield _sse(ev)
+                        await sink(ev)
 
-            # ---------- plan：规划执行 ----------
+            # ---------- plan：规划执行（审批发生在 run_step 深处） ----------
             async def run_step(step: PlanStep) -> str:
-                """执行计划中的单步：跑一次单循环，收集工具事件与文本结果。"""
-                nonlocal first_token_ms
-                instruction = (
-                    f"你正在执行一个多步计划中的一步（总目标：{payload.message}）。\n"
-                    f"本步目标：{step.goal}\n"
-                    + (f"建议使用的工具：{step.tool_hint}\n" if step.tool_hint else "")
-                    + "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
-                )
-                started, ended = _fresh_sets()
-                chunks: list[str] = []
-                step_input = {"messages": history_msgs + [HumanMessage(content=instruction)]}
-                async for ev in forward_tool_events(
-                    agent.astream_events(step_input, version="v2"),
-                    started, ended, step_id=step.id,
-                ):
-                    if ev.get("_raw") is not None:
-                        event = ev["_raw"]
-                        if event.get("event") == "on_chat_model_stream":
-                            chunk = event["data"].get("chunk")
-                            content = chunk.content if chunk else None
-                            if isinstance(content, str) and content:
-                                if first_token_ms is None:
-                                    first_token_ms = int((time.perf_counter() - started_at) * 1000)
-                                chunks.append(content)
-                                yield_soon = {"type": "step_text", "id": step.id, "delta": content}
-                                await plan_queue.put(yield_soon)
-                    else:
-                        await plan_queue.put(ev)
-                return "".join(chunks)
-
-            async def drain_queue(q: asyncio.Queue) -> AsyncIterator[dict]:
-                """消费执行器产生的事件，直到任务结束且队列排空。"""
-                while True:
-                    try:
-                        evt = await asyncio.wait_for(q.get(), timeout=0.05)
-                    except asyncio.TimeoutError:
-                        if task.done() and q.empty():
-                            break
-                        continue
-                    yield evt
+                """执行计划中的单步；返回文本结果，用户拒绝写操作则抛 ApprovalDenied。"""
+                token = current_step_id.set(step.id)  # 审批拒绝归属到本步骤
+                try:
+                    instruction = (
+                        f"你正在执行一个多步计划中的一步（总目标：{payload.message}）。\n"
+                        f"本步目标：{step.goal}\n"
+                        + (f"建议使用的工具：{step.tool_hint}\n" if step.tool_hint else "")
+                        + "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
+                    )
+                    started, ended = _fresh_sets()
+                    chunks: list[str] = []
+                    step_input = {"messages": history_msgs + [HumanMessage(content=instruction)]}
+                    async for ev in forward_tool_events(
+                        agent.astream_events(step_input, version="v2"),
+                        started, ended, step_id=step.id,
+                    ):
+                        if ev.get("_raw") is not None:
+                            event = ev["_raw"]
+                            if event.get("event") == "on_chat_model_stream":
+                                chunk = event["data"].get("chunk")
+                                content = chunk.content if chunk else None
+                                if isinstance(content, str) and content:
+                                    chunks.append(content)
+                                    await sink({"type": "step_text", "id": step.id,
+                                                "delta": content})
+                        else:
+                            await sink(ev)
+                    if approval.denials_for(step.id):
+                        raise ApprovalDenied("用户拒绝执行该写操作")
+                    return "".join(chunks)
+                finally:
+                    current_step_id.reset(token)
 
             mode_used = mode
             degraded = False
             plan_meta: dict | None = None
-            executor: ExecutionResult | None = None
 
-            if mode == "plan":
-                # 规划（拆解失败 → 降级 direct）
+            async def run_plan() -> dict:
+                """规划执行主流程；规划失败/无产出时降级 direct（事件仍入同一队列）。"""
+                nonlocal mode_used, degraded, plan_meta
+                plan: Plan | None = None
                 try:
                     steps = await retry_async(
                         lambda: create_plan(
@@ -298,64 +332,82 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     )
                     plan = Plan(steps=steps)
                 except Exception as exc:  # noqa: BLE001
-                    yield _sse({"type": "fallback", "to": "direct",
+                    await sink({"type": "fallback", "to": "direct",
                                 "reason": f"规划失败：{type(exc).__name__}: {exc}"})
                     mode_used = "direct"
                     degraded = True
-                    plan = None
 
+                executor: ExecutionResult | None = None
                 if plan is not None:
-                    plan_queue: asyncio.Queue = asyncio.Queue()
+                    text_seen = False
 
-                    async def emit(evt: dict) -> None:
-                        await plan_queue.put(evt)
+                    async def tracked_emit(evt: dict) -> None:
+                        nonlocal text_seen
+                        if evt.get("type") == "text":
+                            text_seen = True
+                        await sink(evt)
 
-                    task = asyncio.create_task(execute_plan(
+                    executor = await execute_plan(
                         llm, payload.message, plan, run_step,
                         tools=pretty_names,
                         step_retries=settings.agent_step_retries,
                         max_replans=settings.agent_max_replans,
-                        emit=emit,
-                    ))
-                    async for evt in drain_queue(plan_queue):
-                        if evt.get("type") == "text":
-                            collected_text.append(evt.get("delta", ""))
-                            if first_token_ms is None:
-                                first_token_ms = int((time.perf_counter() - started_at) * 1000)
-                        yield _sse(evt)
-
-                    try:
-                        executor = await task
-                    except Exception as exc:  # noqa: BLE001 — 执行器崩溃降级 direct
-                        yield _sse({"type": "fallback", "to": "direct",
-                                    "reason": f"执行器异常：{type(exc).__name__}: {exc}"})
+                        emit=tracked_emit,
+                    )
+                    plan_meta = {
+                        "steps": [s.to_dict() for s in executor.plan.steps],
+                        "revised": executor.plan.revised,
+                        "degraded": executor.degraded,
+                        "done": executor.steps_done,
+                        "failed": executor.steps_failed,
+                    }
+                    if executor.user_denied and not executor.answer:
+                        # 用户主动拒绝：不降级（降级会再次触发审批），直接说明
+                        await sink({"type": "text",
+                                    "delta": "已按您的选择取消了写入操作，未保存任何数据。"})
+                        return {"mode_used": "plan", "plan_meta": plan_meta,
+                                "degraded": False}
+                    if not executor.success:
+                        # 一步都没成功 → 回退单循环，保证有回答
+                        await sink({"type": "fallback", "to": "direct",
+                                    "reason": executor.error or "规划执行无产出"})
                         mode_used = "direct"
                         degraded = True
+                    elif executor.answer and not text_seen:
+                        # 综合走了非流式回退 → 整段补发
+                        await sink({"type": "text", "delta": executor.answer})
 
-                    if executor is not None:
-                        plan_meta = {
-                            "steps": [s.to_dict() for s in executor.plan.steps],
-                            "revised": executor.plan.revised,
-                            "degraded": executor.degraded,
-                            "done": executor.steps_done,
-                            "failed": executor.steps_failed,
-                        }
-                        if not executor.success and not collected_text:
-                            # 一步都没成功 → 回退单循环，保证有答案
-                            yield _sse({"type": "fallback", "to": "direct",
-                                        "reason": executor.error or "规划执行无产出"})
-                            mode_used = "direct"
-                            degraded = True
-                        elif executor.answer and not collected_text:
-                            # 综合未流式（回退路径）→ 整段补发
-                            collected_text.append(executor.answer)
-                            if first_token_ms is None:
-                                first_token_ms = int((time.perf_counter() - started_at) * 1000)
-                            yield _sse({"type": "text", "delta": executor.answer})
+                if mode_used == "direct":
+                    await run_direct()
+                return {"mode_used": mode_used, "plan_meta": plan_meta,
+                        "degraded": degraded}
 
-            if mode_used == "direct":
-                async for sse_str in direct_loop():
-                    yield sse_str
+            # ---------- 启动后台任务 ----------
+            if mode == "plan":
+                task = asyncio.create_task(run_plan())
+            else:
+                async def _direct_flow() -> dict:
+                    await run_direct()
+                    return {"mode_used": "direct", "plan_meta": None, "degraded": False}
+                task = asyncio.create_task(_direct_flow())
+
+            # ---------- drain 队列 → SSE（任务完成且队列排空后退出） ----------
+            while True:
+                if task.done() and event_queue.empty():
+                    break
+                try:
+                    evt = await asyncio.wait_for(event_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+                etype = evt.get("type")
+                if etype in ("text", "step_text") and first_token_ms is None:
+                    first_token_ms = int((time.perf_counter() - started_at) * 1000)
+                if etype == "text":
+                    collected_text.append(evt.get("delta", ""))
+                yield _sse(evt)
+
+            # 任务异常 → 错误事件（由外层 except 统一处理）
+            result = task.result()
 
             answer = "".join(collected_text)
             latency = int((time.perf_counter() - started_at) * 1000)
@@ -371,8 +423,8 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                         json.dumps(retrieval_sources, ensure_ascii=False) if retrieval_sources else None
                     ),
                     plan=(
-                        json.dumps(plan_meta, ensure_ascii=False)
-                        if plan_meta is not None else None
+                        json.dumps(result["plan_meta"], ensure_ascii=False)
+                        if result and result.get("plan_meta") is not None else None
                     ),
                     latency_ms=latency,
                     first_token_ms=first_token_ms,
@@ -385,14 +437,16 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     "conversation_id": conversation.id,
                     "latency_ms": latency,
                     "first_token_ms": first_token_ms,
-                    "mode": mode_used,
-                    "degraded": degraded,
-                    "plan": plan_meta,
+                    "mode": result["mode_used"] if result else mode_used,
+                    "degraded": result["degraded"] if result else degraded,
+                    "plan": result["plan_meta"] if result else plan_meta,
                 }
             )
         except Exception as e:  # noqa: BLE001
             yield _sse({"type": "error", "message": f"服务异常：{e}"})
         finally:
+            if task is not None and not task.done():
+                task.cancel()  # 客户端断开等中断场景：停止后台执行
             db.close()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
