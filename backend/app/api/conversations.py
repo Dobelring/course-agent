@@ -1,8 +1,8 @@
-"""对话历史：会话列表 / 详情 / 删除（仅限当前用户自己的会话）。"""
+"""对话历史：会话列表 / 详情 / 重命名 / 删除（仅限当前用户自己的会话）。"""
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,10 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 class ConversationCreate(BaseModel):
     title: str = "新对话"
+
+
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 def _get_own_conversation(db: Session, user: User, cid: int) -> AiConversation:
@@ -43,12 +47,17 @@ def list_conversations(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # 计数只统计 assistant 消息 = 大模型回复次数（不是 user+assistant 总条数）
     rows = (
         db.query(
             AiConversation,
             func.count(AiMessage.id).label("msg_count"),
         )
-        .outerjoin(AiMessage, AiMessage.conversation_id == AiConversation.id)
+        .outerjoin(
+            AiMessage,
+            (AiMessage.conversation_id == AiConversation.id)
+            & (AiMessage.role == "assistant"),
+        )
         .filter(AiConversation.user_id == current_user.id)
         .group_by(AiConversation.id)
         .order_by(AiConversation.updated_at.desc())
@@ -100,6 +109,22 @@ def get_conversation(
             for m in msgs
         ],
     }
+
+
+@router.patch("/{cid}")
+def rename_conversation(
+    cid: int,
+    payload: ConversationUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    conv = _get_own_conversation(db, current_user, cid)
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="标题不能为空")
+    conv.title = title
+    db.commit()
+    return {"id": conv.id, "title": conv.title}
 
 
 @router.delete("/{cid}")

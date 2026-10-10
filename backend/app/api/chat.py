@@ -181,6 +181,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
 
         db = SessionLocal()
         conversation = None
+        created_here = False  # 本请求新建的会话：失败收尾时若无消息则清理，不留空白会话
         collected_text: list[str] = []
         tool_records: list[dict] = []
         retrieval_sources = None
@@ -198,6 +199,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                 db.add(conversation)
                 db.commit()
                 db.refresh(conversation)
+                created_here = True
 
             # 每次会话拉起独立 MCP 服务器子进程（stdio），工具调用后自动清理
             client = MultiServerMCPClient(mcp_client_config())
@@ -584,6 +586,20 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
             if task is not None and not task.done():
                 task.cancel()  # 客户端断开等中断场景：停止后台执行
             _unregister_run(run_id)
+            # 本请求新建且一条消息都没落库（失败/断线）→ 空白会话，删除避免残留
+            if created_here and conversation is not None:
+                try:
+                    db.rollback()
+                    n = (
+                        db.query(AiMessage)
+                        .filter(AiMessage.conversation_id == conversation.id)
+                        .count()
+                    )
+                    if n == 0:
+                        db.delete(conversation)
+                        db.commit()
+                except Exception:  # noqa: BLE001 — 清理失败不影响主流程
+                    db.rollback()
             db.close()
 
     return StreamingResponse(gen(), media_type="text/event-stream")

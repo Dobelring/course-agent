@@ -89,11 +89,13 @@ async def synthesize(
         ),
     }]
 
-    # 1) 流式：ChatOpenAI 等实现提供 .stream()，逐 chunk 转发给前端
-    if hasattr(llm, "stream"):
+    # 1) 流式：ChatOpenAI 等提供异步 .astream()，逐 chunk 转发给前端。
+    #    注意必须用 astream——曾经误用同步 .stream() 配 async for，
+    #    TypeError 被吞后永远走非流式回退（规划模式不流式的根因）。
+    if hasattr(llm, "astream"):
         parts: list[str] = []
         try:
-            async for chunk in llm.stream(prompt):
+            async for chunk in llm.astream(prompt):
                 delta = getattr(chunk, "content", "")
                 if isinstance(delta, str) and delta:
                     parts.append(delta)
