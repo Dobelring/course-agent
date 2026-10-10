@@ -90,6 +90,7 @@ def get_conversation(
                 "content": m.content,
                 "tool_calls": json.loads(m.tool_calls) if m.tool_calls else [],
                 "retrieval_sources": json.loads(m.retrieval_sources) if m.retrieval_sources else None,
+                "plan": json.loads(m.plan) if m.plan else None,
                 "latency_ms": m.latency_ms,
                 "created_at": str(m.created_at),
             }

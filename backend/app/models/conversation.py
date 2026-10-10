@@ -13,6 +13,8 @@ class AiConversation(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="新对话")
+    # 累积式对话摘要：历史超预算时旧消息压缩进此字段，形成跨请求的长期记忆
+    summary: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
@@ -30,6 +32,8 @@ class AiMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[str | None] = mapped_column(Text)  # JSON: [{name, input, output}]
     retrieval_sources: Mapped[str | None] = mapped_column(Text)  # JSON: [{filename, score, ...}]
+    # 规划执行元数据：JSON {steps, revised, degraded, done, failed}（仅 plan 模式落库）
+    plan: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int | None] = mapped_column(Integer)  # 总耗时（请求开始到流式结束）
     first_token_ms: Mapped[int | None] = mapped_column(Integer)  # 首字耗时（到第一个字输出）
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

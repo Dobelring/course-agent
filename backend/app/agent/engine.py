@@ -121,12 +121,18 @@ def build_system_prompt(user: User) -> str:
     )
 
 
-def build_agent(user: User, tools: list[BaseTool]):
-    """组装 LangGraph 风格的 tool-calling agent（工具已绑定用户身份）。"""
+def build_agent(user: User, tools: list[BaseTool], extra_system: str = ""):
+    """组装 LangGraph 风格的 tool-calling agent（工具已绑定用户身份）。
+
+    :param extra_system: 追加到系统提示的内容（如压缩后的对话摘要）。
+    """
+    prompt = build_system_prompt(user)
+    if extra_system:
+        prompt += f"\n\n{extra_system}"
     return create_agent(
         build_llm(),
         tools,
-        system_prompt=build_system_prompt(user),
+        system_prompt=prompt,
     )
 
 
