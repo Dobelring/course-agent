@@ -382,14 +382,14 @@ export function deleteAdminScore(token, id) {
 }
 
 /** 流式聊天：POST /api/chat 并以 SSE 方式读取，逐条回调 onEvent({type,...}) */
-export async function chatStream(message, token, onEvent, conversationId = null, mode = 'auto') {
+export async function chatStream(message, token, onEvent, conversationId = null, mode = 'auto', runId = null) {
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ message, conversation_id: conversationId, mode }),
+    body: JSON.stringify({ message, conversation_id: conversationId, mode, run_id: runId }),
   })
   if (!res.ok || !res.body) {
     throw new Error(`请求失败（${res.status}）`)
@@ -432,3 +432,20 @@ export async function resolveApproval(approvalId, approve, token) {
   return res.json()
 }
 
+
+/** 中途取消生成：停掉服务端该 run_id 的后台任务，SSE 流随后收到 cancelled 事件 */
+export async function cancelRun(runId, token) {
+  const res = await fetch('/api/chat/cancel', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ run_id: runId }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.detail || `取消失败（${res.status}）`)
+  }
+  return res.json()
+}

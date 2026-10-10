@@ -4,6 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import {
+  cancelRun,
   chatStream,
   createConversation,
   deleteConversation,
@@ -23,6 +24,7 @@ const busy = ref(false)
 const error = ref('')
 const conversations = ref([])
 const currentConvId = ref(null)
+const currentRunId = ref(null) // 当前生成的 run_id，用于中途取消
 
 function fromHistory(m) {
   if (m.role === 'user') return { role: 'user', content: m.content }
@@ -169,6 +171,8 @@ async function doSend(text) {
   })
   messages.value.push(assistant.value)
   busy.value = true
+  const runId = crypto.randomUUID() // 服务端注册，用于中途取消
+  currentRunId.value = runId
 
   const updateTool = (name, patch) => {
     const t = assistant.value.tools.find((x) => x.name === name)
@@ -246,6 +250,9 @@ async function doSend(text) {
         case 'error':
           error.value = ev.message
           break
+        case 'cancelled':
+          assistant.value.notices.push(`⏹ 已停止生成（已保留 ${ev.partial_chars} 字内容）`)
+          break
         case 'done':
           assistant.value.latency_ms = ev.latency_ms
           assistant.value.first_token_ms = ev.first_token_ms
@@ -257,12 +264,23 @@ async function doSend(text) {
           }
           break
       }
-    }, currentConvId.value, mode.value)
+    }, currentConvId.value, mode.value, runId)
   } catch (e) {
     error.value = e.message
   } finally {
     busy.value = false
+    currentRunId.value = null
     if (props.showHistory) loadConversations()
+  }
+}
+
+// 中途停止：请求服务端取消后台任务，SSE 流随后收到 cancelled 事件并收尾
+async function stop() {
+  if (!busy.value || !currentRunId.value) return
+  try {
+    await cancelRun(currentRunId.value, props.token)
+  } catch (e) {
+    // 任务已结束等竞态：忽略，等流自行收尾
   }
 }
 
@@ -384,8 +402,16 @@ onMounted(() => {
             :disabled="busy"
             @keyup.enter="send"
           />
-          <button :disabled="busy || !input.trim()" @click="send">
-            {{ busy ? '思考中…' : '发送' }}
+          <button
+            v-if="busy"
+            class="stop-btn"
+            title="停止本次生成"
+            @click="stop"
+          >
+            ■ 停止
+          </button>
+          <button v-else :disabled="!input.trim()" @click="send">
+            发送
           </button>
         </div>
       </div>
@@ -802,6 +828,10 @@ onMounted(() => {
 .row button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.row button.stop-btn {
+  background: #dc2626;
 }
 
 .error {
