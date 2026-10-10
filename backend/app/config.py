@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     agent_max_steps: int = 5
     agent_step_retries: int = 2
     agent_max_replans: int = 2
+    # 写操作审批（human-in-the-loop）：命中的工具执行前须经 SSE 审批，超时视为拒绝
+    agent_approval_tools: str = "save_study_plan"
+    agent_approval_timeout: int = 60
+
+    # 检索管线：混合召回（BM25 + 向量 RRF 融合）与交叉编码器重排
+    rag_hybrid: bool = True
+    rag_rerank: bool = True
+    rag_recall_k: int = 20      # 每路召回候选数
+    rag_rerank_top: int = 10    # 送入重排的候选数（重排后取 top_k）
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"
 
 
 settings = Settings()

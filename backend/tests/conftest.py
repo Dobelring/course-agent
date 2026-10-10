@@ -11,6 +11,8 @@ _TEST_DB = Path(__file__).resolve().parent / "test_course_agent.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
 # 单元测试不依赖模型服务；/chat 的“未配置 Key”错误分支也依赖此状态
 os.environ["LLM_API_KEY"] = ""
+# 单测关闭交叉编码器重排（避免下载模型）；混合召回保持开启以覆盖 RRF 逻辑
+os.environ["RAG_RERANK"] = "false"
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import bcrypt  # noqa: E402
