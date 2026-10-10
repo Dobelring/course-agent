@@ -191,3 +191,40 @@ def test_empty_step_output_counts_as_failure():
 
     result = run(execute_plan(FakeLLM("x"), "目标", _plan("s"), empty_step, step_retries=0))
     assert result.success is False
+
+
+# ---------- 综合流式（astream） ----------
+
+def test_synthesis_streams_via_astream():
+    """有 astream 的 LLM → 综合逐 chunk emit text 事件（流式输出）。
+
+    回归防线：曾误用同步 .stream() 配 async for，TypeError 被吞后
+    永远走非流式回退 → 规划模式整段吐答案。
+    """
+    events, emit = _collector()
+
+    class StreamLLM:
+        async def astream(self, messages):
+            for part in ("第一段，", "第二段。"):
+                yield SimpleNamespace(content=part)
+
+    async def run_step(step):
+        return "步骤结果"
+
+    result = run(execute_plan(StreamLLM(), "目标", _plan("查课表"), run_step,
+                              emit=emit))
+    assert result.answer == "第一段，第二段。"
+    text_deltas = [e["delta"] for e in events if e["type"] == "text"]
+    assert text_deltas == ["第一段，", "第二段。"]  # 逐段流出，非整段补发
+
+
+def test_synthesis_without_astream_falls_back_to_invoke():
+    """没有 astream（也没有 stream）的 LLM → 非流式回退仍产出答案。"""
+    llm = FakeLLM("非流式综合答案")
+
+    async def run_step(step):
+        return "结果"
+
+    result = run(execute_plan(llm, "目标", _plan("A"), run_step))
+    assert result.success is True
+    assert result.answer == "非流式综合答案"

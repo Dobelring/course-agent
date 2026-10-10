@@ -1,23 +1,10 @@
 """chat 集成：模式路由、规划执行事件序列、上下文摘要持久化、字段校验。"""
 import json
 
-import pytest
-
 from app.config import settings
-from fakes import FakeAgent, FakeLLM, _sse_data
+from fakes import _sse_data
 
-
-@pytest.fixture
-def fake_agent_env(monkeypatch):
-    """把 LLM 与 Agent 替换为假实现；MCP 工具加载保持真实（无需 Key）。"""
-    from app.api import chat as chat_mod
-
-    fake_llm = FakeLLM()
-    monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
-    monkeypatch.setattr(chat_mod, "build_agent",
-                        lambda user, tools, extra_system="", llm=None: FakeAgent())
-    return fake_llm
-
+# fake_agent_env 夹具定义在 conftest.py（test_api.py 等也需要复用）
 
 # ---------- 字段校验 ----------
 

@@ -216,3 +216,68 @@ def test_extract_sources_unparseable_returns_none():
     assert _extract_sources(None) is None
     assert _extract_sources("not json at all") is None
     assert _extract_sources({"foo": "bar"}) is None
+
+
+def test_conversation_rename(client, seeded, auth_headers):
+    """重命名：本人成功、他人 404、空标题 422。"""
+    h1 = auth_headers("student1")
+    h2 = auth_headers("student2")
+    cid = client.post("/api/conversations", json={"title": "旧名"}, headers=h1).json()["id"]
+
+    # 本人改名成功（并清理首尾空白）
+    resp = client.patch(f"/api/conversations/{cid}", json={"title": "  新的名字  "}, headers=h1)
+    assert resp.status_code == 200
+    assert resp.json()["title"] == "新的名字"
+
+    # 列表反映新标题
+    titles = [c["title"] for c in client.get("/api/conversations", headers=h1).json()]
+    assert "新的名字" in titles
+
+    # 他人改名 → 404（不泄露存在性）
+    assert client.patch(f"/api/conversations/{cid}",
+                        json={"title": "劫持"}, headers=h2).status_code == 404
+
+    # 空标题 → 422（pydantic min_length 拦截纯空串；全空白由 strip 后手动拦截）
+    assert client.patch(f"/api/conversations/{cid}",
+                        json={"title": ""}, headers=h1).status_code == 422
+    assert client.patch(f"/api/conversations/{cid}",
+                        json={"title": "   "}, headers=h1).status_code == 422
+
+
+def test_conversation_msg_count_counts_assistant_only(client, seeded, auth_headers, db):
+    """列表 msg_count = 大模型回复次数（只数 assistant，不是 user+assistant 总数）。"""
+    from app.models.conversation import AiMessage
+
+    h1 = auth_headers("student1")
+    cid = client.post("/api/conversations", json={"title": "计数"}, headers=h1).json()["id"]
+    # 3 轮对话 = 3 user + 3 assistant
+    for i in range(3):
+        db.add(AiMessage(conversation_id=cid, role="user", content=f"问{i}"))
+        db.add(AiMessage(conversation_id=cid, role="assistant", content=f"答{i}"))
+    db.commit()
+
+    row = next(c for c in client.get("/api/conversations", headers=h1).json()
+               if c["id"] == cid)
+    assert row["msg_count"] == 3  # 6 条消息 → 3 条回复
+
+
+def test_failed_chat_leaves_no_blank_conversation(
+        client, seeded, auth_headers, fake_agent_env, monkeypatch):
+    """首条消息请求失败 → 本请求新建的空白会话被清理，不残留在侧栏。"""
+    from app.api import chat as chat_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("构建失败")
+
+    # fake_agent_env 先把 build_llm 换成假实现（保证走到建会话之后），
+    # 这里再覆盖 build_agent 让它在会话创建完成后抛错
+    monkeypatch.setattr(chat_mod, "build_agent", boom)
+    resp = client.post("/api/chat",
+                       json={"message": "会不会留下空白会话", "mode": "direct"},
+                       headers=auth_headers("student1"))
+    events = [line[6:] for line in resp.text.splitlines() if line.startswith("data: ")]
+    assert any('"error"' in e for e in events)
+
+    titles = [c["title"] for c in client.get("/api/conversations",
+                                             headers=auth_headers("student1")).json()]
+    assert "会不会留下空白会话" not in titles

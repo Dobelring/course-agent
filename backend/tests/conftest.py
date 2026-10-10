@@ -190,3 +190,19 @@ def auth_headers(client):
         return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
     return _login
+
+
+@pytest.fixture
+def fake_agent_env(monkeypatch):
+    """把 LLM 与 Agent 替换为假实现；MCP 工具加载保持真实（无需 Key）。
+
+    原定义在 test_chat_modes.py，因 test_api.py 也要复用而上移到公共夹具。
+    """
+    from app.api import chat as chat_mod
+    from fakes import FakeAgent, FakeLLM
+
+    fake_llm = FakeLLM()
+    monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
+    monkeypatch.setattr(chat_mod, "build_agent",
+                        lambda user, tools, extra_system="", llm=None: FakeAgent())
+    return fake_llm
