@@ -1,0 +1,42 @@
+{"id": "r01", "type": "retrieval", "query": "什么是装饰器，它的用途有哪些", "expected_doc": "程序设计基础讲义.md"}
+{"id": "r02", "type": "retrieval", "query": "Python里怎么定义一个函数并返回结果", "expected_doc": "程序设计基础讲义.md"}
+{"id": "r03", "type": "retrieval", "query": "类和对象是什么，__init__ 方法干什么用", "expected_doc": "程序设计基础讲义.md"}
+{"id": "r04", "type": "retrieval", "query": "怎么让函数在被调用前后自动打印日志", "expected_doc": "程序设计基础讲义.md"}
+{"id": "r05", "type": "retrieval", "query": "list和dict这些内置类型有什么区别", "expected_doc": "程序设计基础讲义.md"}
+{"id": "r06", "type": "retrieval", "query": "二叉树有哪几种遍历方式", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r07", "type": "retrieval", "query": "快速排序和归并排序的时间复杂度分别是多少", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r08", "type": "retrieval", "query": "哈希表发生冲突怎么处理", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r09", "type": "retrieval", "query": "怎么判断一个有向图能不能拓扑排序", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r10", "type": "retrieval", "query": "循环队列如何区分队空和队满", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r11", "type": "retrieval", "query": "最小生成树的Prim和Kruskal算法分别适合什么场景", "expected_doc": "数据结构复习提纲.md"}
+{"id": "r12", "type": "retrieval", "query": "x趋于0时sinx/x的极限是多少", "expected_doc": "高等数学极限与导数专题.md"}
+{"id": "r13", "type": "retrieval", "query": "洛必达法则在什么条件下才能使用", "expected_doc": "高等数学极限与导数专题.md"}
+{"id": "r14", "type": "retrieval", "query": "常用的等价无穷小替换有哪些", "expected_doc": "高等数学极限与导数专题.md"}
+{"id": "r15", "type": "retrieval", "query": "罗尔定理和拉格朗日中值定理的内容是什么", "expected_doc": "高等数学极限与导数专题.md"}
+{"id": "r16", "type": "retrieval", "query": "函数在一点连续需要满足哪三个条件", "expected_doc": "高等数学极限与导数专题.md"}
+{"id": "r17", "type": "retrieval", "query": "四六级作文的三段式结构分别写什么", "expected_doc": "大学英语四六级写作指南.md"}
+{"id": "r18", "type": "retrieval", "query": "英语段落翻译有哪些常用技巧", "expected_doc": "大学英语四六级写作指南.md"}
+{"id": "r19", "type": "retrieval", "query": "表示转折和递进的英文衔接词有哪些", "expected_doc": "大学英语四六级写作指南.md"}
+{"id": "r20", "type": "retrieval", "query": "四六级写作应该怎么安排备考时间", "expected_doc": "大学英语四六级写作指南.md"}
+{"id": "r21", "type": "retrieval", "query": "模型在训练集上很好但测试集上很差是什么问题，怎么解决", "expected_doc": "机器学习与大模型入门.md"}
+{"id": "r22", "type": "retrieval", "query": "大模型为什么会一本正经地胡说八道", "expected_doc": "机器学习与大模型入门.md"}
+{"id": "r23", "type": "retrieval", "query": "检索增强生成RAG的完整流程是什么", "expected_doc": "机器学习与大模型入门.md"}
+{"id": "r24", "type": "retrieval", "query": "Transformer为什么用自注意力而不用循环结构", "expected_doc": "机器学习与大模型入门.md"}
+{"id": "r25", "type": "retrieval", "query": "监督学习和无监督学习的区别是什么", "expected_doc": "机器学习与大模型入门.md"}
+{"id": "t01", "type": "tool", "query": "我今天有什么课？", "expected_tools": ["get_my_schedule"]}
+{"id": "t02", "type": "tool", "query": "周三下午我有课吗，几点到几点", "expected_tools": ["get_my_schedule"]}
+{"id": "t03", "type": "tool", "query": "我这学期GPA是多少", "expected_tools": ["get_my_scores"]}
+{"id": "t04", "type": "tool", "query": "我哪门课成绩最弱，需要重点补一补", "expected_tools": ["get_my_scores"]}
+{"id": "t05", "type": "tool", "query": "未来一周有哪些作业要交", "expected_tools": ["get_upcoming_assignments"]}
+{"id": "t06", "type": "tool", "query": "有没有已经逾期还没交的作业", "expected_tools": ["get_upcoming_assignments"]}
+{"id": "t07", "type": "tool", "query": "我上传过哪些课程资料", "expected_tools": ["list_my_documents"]}
+{"id": "t08", "type": "tool", "query": "我资料里是怎么讲装饰器的", "expected_tools": ["search_course_documents"]}
+{"id": "t09", "type": "tool", "query": "根据我上传的资料，总结一下复习重点", "expected_tools": ["search_course_documents"]}
+{"id": "t10", "type": "tool", "query": "帮我做一个期末复习计划并保存下来", "expected_tools": ["save_study_plan"]}
+{"id": "t11", "type": "tool", "query": "下周要复习高数和数据结构，帮我排个计划存起来", "expected_tools": ["save_study_plan"]}
+{"id": "t12", "type": "tool", "query": "我周一早上有课吗", "expected_tools": ["get_my_schedule"]}
+{"id": "r26", "type": "retrieval", "query": "性能计时和缓存这类横切关注点该用什么语法实现", "expected_doc": "程序设计基础讲义.md", "difficulty": "hard"}
+{"id": "r27", "type": "retrieval", "query": "怎样把一篇长文章切成小块并向量化存起来", "expected_doc": "机器学习与大模型入门.md", "difficulty": "hard"}
+{"id": "r28", "type": "retrieval", "query": "哪些排序算法是稳定的，哪些不稳定", "expected_doc": "数据结构复习提纲.md", "difficulty": "hard"}
+{"id": "r29", "type": "retrieval", "query": "写信类应用文的格式有什么要求", "expected_doc": "大学英语四六级写作指南.md", "difficulty": "hard"}
+{"id": "r30", "type": "retrieval", "query": "拉格朗日中值定理和罗尔定理是什么关系", "expected_doc": "高等数学极限与导数专题.md", "difficulty": "hard"}
