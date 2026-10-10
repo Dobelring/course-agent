@@ -55,6 +55,8 @@ flowchart LR
 - **多租户身份强制绑定**：`UserBoundTool` 包装层无论模型传入什么 `user_id`，执行前一律覆盖为当前登录用户，从协议层面杜绝越权（水平越权返回 404）
 - **写操作审批（human-in-the-loop）**：`save_study_plan` 等写工具执行前经 SSE 发出 `approval_required`，前端弹窗确认后由独立接口回传决策；超时未决按拒绝处理（fail-closed），拒绝的步骤标记 skipped 且不触发重规划，后续**不依赖**它的步骤照常执行
 - **三模式路由（auto/direct/plan）**：auto 模式先用轻量分类判断复杂度——简单问题走单循环，复杂任务走 **Plan-and-Execute**：LLM 拆解为带依赖的结构化步骤 → **就绪批次并发执行**（`depends_on` 构成 DAG，无依赖步骤 `asyncio.gather` 并行）→ 单步失败先指数退避重试 → 重试耗尽把失败上下文喂回 LLM **重规划**（批次级，新步骤 id 平移防冲突）→ 流式综合产出；规划失败自动降级单循环，保证有回答
+- **跨步骤上下文传递 + 请求级事件去重**：每个步骤的指令注入已完成步骤的真实产出（并明确"禁止重复调用相同工具/重复保存"），从源头减少重复查询；SSE 侧按请求去重工具事件（`tool_start/tool_end` 每工具只上屏一次，`tool_records` 按 (name, input) 记录保留真实调用差异）——E2E 实测同一任务 13 条重复卡片降为 3~4 条
+- **生成可中断**：请求携带 `run_id`，`POST /api/chat/cancel` 取消后台任务（归属校验防取消他人任务），SSE 以 `cancelled` 事件收尾并保留已生成的部分内容；前端"停止"按钮一键中断
 - **两级上下文管理**：历史超字符预算（默认 8000）时，旧消息（含上轮摘要）由 LLM 压缩为工作摘要持久化在会话上，近期消息保留原文——形成「摘要 + 近期原文」的长期记忆
 - **跨会话用户画像（三级记忆的第三级）**：`user_memories` 表按用户持久化画像，每收到 N 条（默认 4）助手消息节流刷新一次——LLM 把「旧画像 + 本会话近期对话」合并，只保留跨会话稳定信息（身份/偏好/薄弱科目），失败 best-effort 不阻断对话；画像注入系统提示，实现「跨会话记得你是谁」
 - **Token/成本核算**：`UsageCollector` 挂在 LLM 实例回调上，一次请求聚合分类/规划/步骤/综合全部调用的 input/output token，按官网单价折算成本，落库 `ai_messages`（input_tokens/output_tokens/cost_cny）并在 SSE `done` 事件与仪表盘展示；`/api/stats/me` 聚合总额，评测脚本同样上报自身消耗
@@ -138,7 +140,7 @@ Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · L
 
 ## 测试
 
-后端内置 **165 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆与 API 集成，全部离线可跑（无需 API Key）：
+后端内置 **175 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**与 API 集成，全部离线可跑（无需 API Key）：
 
 ```bash
 cd backend
@@ -164,12 +166,15 @@ python -m pytest tests/test_planner.py -v # 单文件
 | `test_usage.py` | **Token 成本核算**：OpenAI usage 与 usage_metadata 双载体提取、多调用聚合、计价公式、空 usage 不计 |
 | `test_memory.py` | **跨会话记忆**：画像节流刷新、跨会话持久与合并、LLM 失败 best-effort、阈值内零 LLM 调用 |
 | `test_eval_report.py` | 评测结果按 suite 合并（修复单跑覆盖 bug）、坏文件恢复、目录自动创建 |
+| `test_interrupt_dedup.py` | **工具去重**（同请求同工具只上屏一次）、**前序结果注入指令**（防重复查询+防重复保存）、**取消语义**（注册表/归属校验/CancelledError 收尾） |
 | `test_chat_modes.py` | 模式路由 SSE 事件序列、plan 元数据落库、规划失败降级 direct、摘要持久化 |
 | `test_api.py` | 登录注册、课表/计划/会话跨用户 404、学生访问管理接口 403、`/chat` 无 Key 时 SSE 优雅报错 |
 
 每个用例使用独立 SQLite 测试库并在前后重建表，用例之间完全隔离。
 
-**真实 Key E2E**（`scripts/e2e_approval.py`，需 `LLM_API_KEY`）：plan 模式 4 步任务实测——LLM 自主给出依赖 `[{},{},{},{1,2,3}]`（三路扇出 + 汇聚），`step_end` 顺序 `#1→#3→#2` 证明并发交织，`save_study_plan` 触发 `approval_required` → 决策 200 → 步骤完成，全链路 `4/4 done, 0 failed`。
+**真实 Key E2E**（`scripts/e2e_approval.py` / `scripts/e2e_fixes.py`，需 `LLM_API_KEY`）：
+- **审批 + 并发**（e2e_approval）：plan 模式 4 步任务，LLM 自主给出依赖 `[{},{},{},{1,2,3}]`（三路扇出 + 汇聚），`step_end` 顺序 `#1→#3→#2` 证明并发交织，`save_study_plan` 触发 `approval_required` → 决策 200 → 全链路 `4/4 done, 0 failed`
+- **去重 + 中断**（e2e_fixes）：同一任务 `tool_start` 仅 3~4 个（修复前 13 条含大量重复）；`run_id` + `POST cancel` → 流以 `cancelled` 收尾、重复取消 404、已生成部分落库标记「已手动停止」
 
 ## 评测（Evaluation）
 
@@ -229,7 +234,7 @@ python scripts/eval.py all         # 全部
 
 | 局限 | 现状 | 改进方案 |
 |---|---|---|
-| **审批注册表是单进程内存**（`approval.py` 的 `PENDING`） | 依赖 asyncio 单线程 + 单 worker 部署，跨进程无法传递 Future | 多 worker 部署时换 Redis Pub/Sub 或数据库轮询解锁；横向扩容前必须处理 |
+| **审批/取消注册表是单进程内存**（`approval.py` 的 `PENDING`、`chat.py` 的 `ACTIVE_RUNS`） | 依赖 asyncio 单线程 + 单 worker 部署，跨进程无法传递 Future/任务句柄 | 多 worker 部署时换 Redis Pub/Sub 或数据库轮询解锁；横向扩容前必须处理 |
 | **工具评测样本量小** | 12 条指令、6 条规划查询，统计置信有限 | 扩到 50+ 条并按工具/意图分层抽样 |
 | **完成率评测依赖演示数据** | 断言基于 seed 数据的字段（GPA、课程名），换数据集需同步改断言 | 断言改为读数据库期望值而非硬编码 |
 | **MCP 每请求拉起子进程** | 每次聊天 spawn 一次 stdio 子进程，冷启动有开销 | 常驻连接池或改用 streamable HTTP transport |
