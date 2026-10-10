@@ -56,6 +56,8 @@ flowchart LR
 - **写操作审批（human-in-the-loop）**：`save_study_plan` 等写工具执行前经 SSE 发出 `approval_required`，前端弹窗确认后由独立接口回传决策；超时未决按拒绝处理（fail-closed），拒绝的步骤标记 skipped 且不触发重规划，后续**不依赖**它的步骤照常执行
 - **三模式路由（auto/direct/plan）**：auto 模式先用轻量分类判断复杂度——简单问题走单循环，复杂任务走 **Plan-and-Execute**：LLM 拆解为带依赖的结构化步骤 → **就绪批次并发执行**（`depends_on` 构成 DAG，无依赖步骤 `asyncio.gather` 并行）→ 单步失败先指数退避重试 → 重试耗尽把失败上下文喂回 LLM **重规划**（批次级，新步骤 id 平移防冲突）→ 流式综合产出；规划失败自动降级单循环，保证有回答
 - **跨步骤上下文传递 + 请求级事件去重**：每个步骤的指令注入已完成步骤的真实产出（并明确"禁止重复调用相同工具/重复保存"），从源头减少重复查询；SSE 侧按请求去重工具事件（`tool_start/tool_end` 每工具只上屏一次，`tool_records` 按 (name, input) 记录保留真实调用差异）——E2E 实测同一任务 13 条重复卡片降为 3~4 条
+- **全程流式（含规划综合）**：步骤执行中 `step_text` 逐段实时上屏，最终综合走 `astream` 异步流式逐 chunk 下发——修复真实 bug：曾误用**同步** `.stream()` 配 `async for`，`TypeError` 被静默吞掉后永远走非流式回退（综合整段吐出）；修复后 E2E 实测单次回答 **399 个 text 增量 + 185 个 step_text 增量**逐段下发
+- **会话体验**：对话可**重命名**（`PATCH /conversations/{id}`，越权 404、空标题 422）；侧栏计数 = **大模型回复次数**（只数 assistant）；**输入草稿按会话隔离**——切换会话输入框清空、切回草稿还原；**新对话懒创建**——点"新对话"不建库，发首条消息才落库，中途放弃不残留空白会话（请求失败产生的空白会话由服务端 finally 自动清理）
 - **生成可中断**：请求携带 `run_id`，`POST /api/chat/cancel` 取消后台任务（归属校验防取消他人任务），SSE 以 `cancelled` 事件收尾并保留已生成的部分内容；前端"停止"按钮一键中断
 - **两级上下文管理**：历史超字符预算（默认 8000）时，旧消息（含上轮摘要）由 LLM 压缩为工作摘要持久化在会话上，近期消息保留原文——形成「摘要 + 近期原文」的长期记忆
 - **跨会话用户画像（三级记忆的第三级）**：`user_memories` 表按用户持久化画像，每收到 N 条（默认 4）助手消息节流刷新一次——LLM 把「旧画像 + 本会话近期对话」合并，只保留跨会话稳定信息（身份/偏好/薄弱科目），失败 best-effort 不阻断对话；画像注入系统提示，实现「跨会话记得你是谁」
@@ -140,7 +142,7 @@ Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · L
 
 ## 测试
 
-后端内置 **175 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**与 API 集成，全部离线可跑（无需 API Key）：
+后端内置 **180 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**、**会话重命名/计数/空白清理**与 API 集成，全部离线可跑（无需 API Key）：
 
 ```bash
 cd backend
@@ -160,7 +162,7 @@ python -m pytest tests/test_planner.py -v # 单文件
 | `test_resilience.py` | 指数退避重试：瞬时故障恢复、次数耗尽抛出、不可重试异常直抛、退避序列 1s→2s→4s |
 | `test_context.py` | 上下文预算切分、超预算摘要压缩、旧摘要合并进新摘要、预算内不触发 |
 | `test_planner.py` | 复杂度分类（失败降级 simple）、JSON 容错与一次修复、计划步数上限、重规划带失败上下文 |
-| `test_plan_executor.py` | 执行循环：单步重试、失败重规划、重规划耗尽降级、部分成功仍综合、综合失败回退拼接 |
+| `test_plan_executor.py` | 执行循环：单步重试、失败重规划、重规划耗尽降级、部分成功仍综合、综合失败回退拼接、**astream 逐段流式综合**（同步 stream 误用回归防线） |
 | `test_approval.py` | **写操作审批**：注册表/超时拒绝/归属校验、门控工具拒绝时底层不执行、执行器 skipped 语义不重试不降级 |
 | `test_parallel_plan.py` | **并行调度**：依赖解析（前向引用剔除保证无环）、事件门证明并发、扇出扇入 DAG、阻塞跳过、批次级重规划、id 平移 |
 | `test_usage.py` | **Token 成本核算**：OpenAI usage 与 usage_metadata 双载体提取、多调用聚合、计价公式、空 usage 不计 |
@@ -168,13 +170,14 @@ python -m pytest tests/test_planner.py -v # 单文件
 | `test_eval_report.py` | 评测结果按 suite 合并（修复单跑覆盖 bug）、坏文件恢复、目录自动创建 |
 | `test_interrupt_dedup.py` | **工具去重**（同请求同工具只上屏一次）、**前序结果注入指令**（防重复查询+防重复保存）、**取消语义**（注册表/归属校验/CancelledError 收尾） |
 | `test_chat_modes.py` | 模式路由 SSE 事件序列、plan 元数据落库、规划失败降级 direct、摘要持久化 |
-| `test_api.py` | 登录注册、课表/计划/会话跨用户 404、学生访问管理接口 403、`/chat` 无 Key 时 SSE 优雅报错 |
+| `test_api.py` | 登录注册、课表/计划/会话跨用户 404、学生访问管理接口 403、`/chat` 无 Key 时 SSE 优雅报错、**会话重命名（越权 404/空标题 422）**、**计数只数 assistant**、**失败请求不留空白会话** |
 
 每个用例使用独立 SQLite 测试库并在前后重建表，用例之间完全隔离。
 
-**真实 Key E2E**（`scripts/e2e_approval.py` / `scripts/e2e_fixes.py`，需 `LLM_API_KEY`）：
+**真实 Key E2E**（`scripts/e2e_approval.py` / `scripts/e2e_fixes.py` / `scripts/e2e_stream_rename.py`，需 `LLM_API_KEY`）：
 - **审批 + 并发**（e2e_approval）：plan 模式 4 步任务，LLM 自主给出依赖 `[{},{},{},{1,2,3}]`（三路扇出 + 汇聚），`step_end` 顺序 `#1→#3→#2` 证明并发交织，`save_study_plan` 触发 `approval_required` → 决策 200 → 全链路 `4/4 done, 0 failed`
 - **去重 + 中断**（e2e_fixes）：同一任务 `tool_start` 仅 3~4 个（修复前 13 条含大量重复）；`run_id` + `POST cancel` → 流以 `cancelled` 收尾、重复取消 404、已生成部分落库标记「已手动停止」
+- **流式 + 会话**（e2e_stream_rename）：plan 综合逐段流式（单次回答 399 个 text 增量 + 185 个 step_text 增量，修复前整段 1 个）；侧栏计数 = assistant 条数；重命名 200 / 越权 404 / 空标题 422
 
 ## 评测（Evaluation）
 
