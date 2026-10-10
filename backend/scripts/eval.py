@@ -1,13 +1,15 @@
-r"""评测脚本：检索质量（离线）+ 工具选择/规划质量（需 LLM_API_KEY）。
+r"""评测脚本：检索 / 工具选择 / 规划 / 端到端执行 四套件。
 
 用法（backend 目录）：
     python scripts/eval.py retrieval      # 检索评测，无需 API Key
     python scripts/eval.py tools          # 工具选择评测，需要 LLM_API_KEY
     python scripts/eval.py plan           # 规划质量评测（分类+拆解），需要 Key
+    python scripts/eval.py execution      # 端到端完成率（真实执行+断言），需要 Key
     python scripts/eval.py all            # 全部
 
 检索指标：Hit@1、Hit@3、MRR。工具指标：工具命中率。
 规划指标：复杂度分类准确率、计划工具覆盖率、完全覆盖率。
+执行指标：任务完成率（答案内容断言 + DB 状态断言；写操作由自动审批器批准）。
 语料：data/eval/corpus/ 下 5 份文档，独立评测用户 eval_user，不污染业务数据。
 """
 from __future__ import annotations
@@ -20,6 +22,9 @@ from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ 自身（eval_report）
+
+from eval_report import merge_results  # noqa: E402
 
 # 评测使用独立的 SQLite 库，与开发库（course_agent.db）完全隔离；
 # 必须在导入任何 app.* 模块（进而实例化 settings）之前设置。
@@ -332,16 +337,241 @@ async def run_plan_eval() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 端到端执行评测（真实 LLM + MCP + DB 断言）
+# ---------------------------------------------------------------------------
+def seed_execution_data(db, user) -> None:
+    """为执行评测播种确定性业务数据（幂等）。
+
+    断言依赖（与 eval_set.jsonl 的 e1-e5 对应）：
+    - 成绩：数据结构 92、高等数学 61 → e1「最弱=高等数学」、e5「92 分」
+    - 课表：周四(weekday=4) 数据结构 → e2「周四=数据结构」
+    - 作业：2 天后截止、标题含「实验」→ e5「实验」
+    """
+    from datetime import datetime, timedelta
+
+    from app.models.assignment import Assignment
+    from app.models.course import Course, Schedule
+    from app.models.score import Score
+
+    if db.query(Score).filter(Score.user_id == user.id).count() >= 2:
+        return  # 已播种（幂等）
+
+    cs = Course(code="EVAL-CS201", name="数据结构", teacher="王老师", credit=3)
+    ma = Course(code="EVAL-MA101", name="高等数学", teacher="赵老师", credit=5)
+    db.add_all([cs, ma])
+    db.flush()
+    db.add(Score(user_id=user.id, course_id=cs.id, score=92))
+    db.add(Score(user_id=user.id, course_id=ma.id, score=61))
+    db.add(Schedule(user_id=user.id, course_id=cs.id, weekday=4,
+                    start_period=5, end_period=6, week_start=1, week_end=16,
+                    location="教三201"))
+    db.add(Assignment(user_id=user.id, course_id=cs.id,
+                      title="数据结构实验：红黑树实现",
+                      due_at=datetime.now() + timedelta(days=2), status="pending"))
+    db.commit()
+    print("执行评测数据已播种：成绩/课表/作业（幂等）")
+
+
+async def _auto_approver(stop: asyncio.Event, user_id: int) -> None:
+    """评测自动审批器：批准 eval_user 的写操作审批（模拟用户点击「允许」）。
+
+    与被测请求同处一个事件循环——请求阻塞在审批 Future 上时，本任务仍被调度，
+    这正是 ASGI 单循环下人工审批的等价物。
+    """
+    from app.agent.approval import PENDING, decide
+
+    while not stop.is_set():
+        for aid in list(PENDING.keys()):
+            try:
+                decide(aid, True, user_id)
+            except Exception:  # noqa: BLE001 — 评测容错
+                pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.05)
+        except asyncio.TimeoutError:
+            continue
+
+
+def _parse_chat_sse(body: str) -> dict:
+    """解析 /chat 的 SSE 响应体 → {answer, done, errors, approvals}。"""
+    answer, done, errors, approvals = [], None, [], []
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            ev = json.loads(line[6:])
+        except ValueError:
+            continue
+        t = ev.get("type")
+        if t == "text":
+            answer.append(ev.get("delta") or "")
+        elif t == "done":
+            done = ev
+        elif t == "error":
+            errors.append(ev.get("message"))
+        elif t == "approval_required":
+            approvals.append(ev)
+    return {"answer": "".join(answer), "done": done,
+            "errors": errors, "approvals": approvals}
+
+
+async def run_execution_eval(db, user) -> dict:
+    """端到端任务完成率：真实执行 chat → 断言答案内容与 DB 状态。"""
+    from app.config import settings
+
+    if not settings.llm_api_key:
+        print("\n[跳过] 未配置 LLM_API_KEY，执行评测需要真实模型。")
+        return {"skipped": True}
+
+    import time as _time
+
+    import httpx
+    from httpx import ASGITransport, AsyncClient
+
+    from app.agent.approval import PENDING
+    from app.core.security import create_access_token
+    from app.main import app
+    from app.models.plan import StudyPlan, StudyPlanItem
+
+    seed_execution_data(db, user)
+    # 评测内关闭画像刷新（避免额外 LLM 调用引入不确定性与延迟）
+    settings.memory_refresh_every = 10**9
+
+    def _plan_count() -> int:
+        return db.query(StudyPlan).filter(StudyPlan.user_id == user.id).count()
+
+    def _latest_plan_items() -> int:
+        latest = (
+            db.query(StudyPlan)
+            .filter(StudyPlan.user_id == user.id)
+            .order_by(StudyPlan.id.desc())
+            .first()
+        )
+        if latest is None:
+            return 0
+        return (
+            db.query(StudyPlanItem)
+            .filter(StudyPlanItem.plan_id == latest.id)
+            .count()
+        )
+
+    token = create_access_token(user.id, user.username, user.role)
+    headers = {"Authorization": f"Bearer {token}"}
+    cases = load_cases("execution")
+
+    stop = asyncio.Event()
+    approver_task = asyncio.create_task(_auto_approver(stop, user.id))
+    details: list[dict] = []
+    passed_total = 0
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "cost_cny": 0.0}
+
+    print(f"\n== 端到端执行评测（{len(cases)} 条，真实 LLM + MCP；写操作自动批准）==\n")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://eval.local",
+                           timeout=httpx.Timeout(600.0)) as client:
+        for case in cases:
+            mode = case.get("mode", "direct")
+            plans_before = _plan_count()
+            started = _time.perf_counter()
+            checks: list[dict] = []
+            try:
+                resp = await asyncio.wait_for(
+                    client.post(
+                        "/api/chat",
+                        headers=headers,
+                        json={"message": case["query"], "mode": mode},
+                    ),
+                    timeout=600,
+                )
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                checks.append({"name": "请求成功", "ok": False,
+                               "note": f"{type(exc).__name__}: {exc}"})
+                details.append({"id": case["id"], "query": case["query"],
+                                "mode": mode, "passed": False, "checks": checks})
+                print(f"{case['id']:<4} ✗ 请求失败 {checks[0]['note'][:80]}")
+                continue
+
+            parsed = _parse_chat_sse(resp.text)
+            answer, done = parsed["answer"], parsed["done"]
+            latency_ms = int((_time.perf_counter() - started) * 1000)
+
+            # ---- 通用断言 ----
+            checks.append({"name": "无错误事件", "ok": not parsed["errors"],
+                           "note": "; ".join(parsed["errors"])[:120]})
+            checks.append({"name": "收到 done 事件", "ok": done is not None, "note": ""})
+            if done and done.get("usage"):
+                for k in total_usage:
+                    total_usage[k] += (done["usage"].get(k) or 0)
+
+            # ---- 内容断言 ----
+            for kw in case.get("must_contain", []):
+                checks.append({"name": f"答案含「{kw}」", "ok": kw in answer,
+                               "note": (answer[:100] if not kw in answer else "")})
+
+            # ---- DB 状态断言 ----
+            if case.get("check") == "plan_saved":
+                db.expire_all()
+                plans_after = _plan_count()
+                created = plans_after > plans_before
+                checks.append({"name": "新增学习计划", "ok": created,
+                               "note": f"{plans_before} → {plans_after}"})
+                min_items = case.get("min_items", 1)
+                items = _latest_plan_items()
+                checks.append({"name": f"计划条目 ≥ {min_items}", "ok": items >= min_items,
+                               "note": f"items={items}"})
+
+            passed = all(c["ok"] for c in checks)
+            passed_total += int(passed)
+            details.append({
+                "id": case["id"], "query": case["query"], "mode": mode,
+                "passed": passed, "checks": checks,
+                "approvals": len(parsed["approvals"]),
+                "latency_ms": latency_ms,
+                "answer_head": answer[:120],
+                "usage": done.get("usage") if done else None,
+            })
+            mark = "✓" if passed else "✗"
+            failed = [c["name"] for c in checks if not c["ok"]]
+            print(f"{case['id']:<4} {mark} {case['query'][:34]}"
+                  + (f"  [{', '.join(failed)}]" if failed else "")
+                  + f"  ({latency_ms / 1000:.1f}s)")
+
+    stop.set()
+    await approver_task
+    still_pending = len(PENDING)
+    if still_pending:
+        print(f"警告：退出时仍有 {still_pending} 个未决审批")
+
+    n = len(cases)
+    metrics = {
+        "queries": n,
+        "passed": passed_total,
+        "completion_rate": round(passed_total / n, 4) if n else 0.0,
+        "skipped": False,
+        "eval_usage": total_usage,
+        "details": details,
+    }
+    print("-" * 78)
+    print(f"任务完成率 = {metrics['completion_rate']:.2%} ({passed_total}/{n})"
+          f"  评测自身消耗 {total_usage['input_tokens']}+{total_usage['output_tokens']} tokens"
+          f" / ¥{total_usage['cost_cny']:.4f}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if which not in ("retrieval", "tools", "plan", "all"):
+    if which not in ("retrieval", "tools", "plan", "execution", "all"):
         print(__doc__)
         return 2
 
     from app.database import Base, SessionLocal, engine
     from app import models  # noqa: F401
+    from app.main import _ensure_columns
 
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()  # eval.db 可能是旧库：补 plan/token 等后加的列（create_all 不改已有表）
     db = SessionLocal()
     try:
         user, existing = prepare_eval_user(db)
@@ -358,10 +588,13 @@ def main() -> int:
             results["tool"] = asyncio.run(run_tool_eval())
         if which in ("plan", "all"):
             results["plan"] = asyncio.run(run_plan_eval())
+        if which in ("execution", "all"):
+            results["execution"] = asyncio.run(run_execution_eval(db, user))
 
+        # 按 suite 合并写入：单跑一个 suite 不会覆盖其他 suite 的历史结果
         out = BACKEND_DIR / "data" / "eval" / "results.json"
-        out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"\n结果已写入 {out.relative_to(BACKEND_DIR)}")
+        merge_results(out, results)
+        print(f"\n结果已合并写入 {out.relative_to(BACKEND_DIR)}")
         return 0
     finally:
         db.close()

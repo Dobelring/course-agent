@@ -46,3 +46,8 @@
 {"id": "p04", "type": "plan", "query": "帮我把下周的学习安排规划一下：先看课表避开上课时间，再看作业截止日，最后查一下成绩最弱的科目优先复习，写成计划保存", "expected_tools": ["get_my_schedule", "get_upcoming_assignments", "get_my_scores", "save_study_plan"], "expect_complex": true}
 {"id": "p05", "type": "plan", "query": "我 GPA 是多少，哪门课最弱？", "expected_tools": ["get_my_scores"], "expect_complex": false}
 {"id": "p06", "type": "plan", "query": "周四下午我有课吗", "expected_tools": ["get_my_schedule"], "expect_complex": false}
+{"id": "e1", "type": "execution", "mode": "direct", "query": "我这学期哪门课成绩最弱？", "must_contain": ["高等数学"]}
+{"id": "e2", "type": "execution", "mode": "direct", "query": "我周四有什么课？", "must_contain": ["数据结构"]}
+{"id": "e3", "type": "execution", "mode": "direct", "query": "我上传的资料里关于装饰器是怎么讲的？", "must_contain": ["装饰器"]}
+{"id": "e4", "type": "execution", "mode": "plan", "query": "结合我的成绩分析最弱的科目，制定一份两周补救计划并保存", "check": "plan_saved", "min_items": 3}
+{"id": "e5", "type": "execution", "mode": "direct", "query": "我未来一周有什么作业？另外数据结构这门课我考了多少分？", "must_contain": ["实验", "92"]}
