@@ -17,6 +17,7 @@ approval_resolved / tool_start / tool_end / text / error / done
 import asyncio
 import json
 import time
+import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -54,6 +55,24 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: int | None = None
     mode: Literal["auto", "direct", "plan"] = "auto"
+    run_id: str | None = None  # 客户端生成，用于中途取消
+
+
+class CancelRequest(BaseModel):
+    run_id: str
+
+
+# 活跃任务注册表：run_id → (owner_user_id, task)。
+# 与审批注册表同局限：单进程内存，多 worker 需换 Redis（见 README 已知局限）。
+ACTIVE_RUNS: dict[str, tuple[int, asyncio.Task]] = {}
+
+
+def _register_run(run_id: str, user_id: int, task: asyncio.Task) -> None:
+    ACTIVE_RUNS[run_id] = (user_id, task)
+
+
+def _unregister_run(run_id: str) -> None:
+    ACTIVE_RUNS.pop(run_id, None)
 
 
 class ApprovalDecision(BaseModel):
@@ -121,12 +140,33 @@ async def resolve_approval(
     return {"ok": True, "approved": payload.approve}
 
 
+@router.post("/cancel")
+async def cancel_run(
+    payload: CancelRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """中途取消：停掉该 run_id 的后台任务，SSE 流随即收到 cancelled 事件。
+
+    归属校验：只能取消自己的任务；未注册（已结束/不存在）返回 404。
+    """
+    entry = ACTIVE_RUNS.get(payload.run_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    owner_id, task = entry
+    if owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+    if not task.done():
+        task.cancel()
+    return {"ok": True}
+
+
 @router.post("")
 async def chat(payload: ChatRequest, current_user: User = Depends(get_current_user)):
     async def gen():
         started_at = time.perf_counter()
         first_token_ms = None  # 第一个字输出时的耗时
         task: asyncio.Task | None = None
+        run_id = payload.run_id or str(uuid.uuid4())  # 提前定义，finally 注销用
         # 用量收集器：挂在 LLM 实例上，覆盖分类/规划/步骤/综合全部调用
         usage = UsageCollector(
             price_input_per_m=settings.llm_price_input_per_m,
@@ -237,19 +277,22 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
             )
             agent = build_agent(current_user, tools, extra_system=extra_system, llm=llm)
 
-            # 同一工具在包装层与底层各触发一次事件，只向前端展示第一组
-            def _fresh_sets() -> tuple[set, set]:
-                return set(), set()
+            # 请求级共享去重集：同一工具整次请求只上屏一次卡片（跨步骤去重）。
+            # tool_records 按 (name, input) 记录——包装层/底层双事件折叠，
+            # 但参数不同的真实调用仍各自留痕，统计不失真。
+            shown_start: set[str] = set()
+            shown_end: set[str] = set()
+            recorded: set[tuple[str, str]] = set()
 
-            async def forward_tool_events(
-                events, started: set, ended: set, step_id: int | None = None
-            ):
+            async def forward_tool_events(events, step_id: int | None = None):
                 """从 astream_events 流中提取工具事件并打标（step_id 可空）。"""
                 async for event in events:
                     etype = event.get("event")
                     name = event.get("name") or ""
-                    if etype == "on_tool_start" and name in tool_names and name not in started:
-                        started.add(name)
+                    if etype == "on_tool_start" and name in tool_names:
+                        if name in shown_start:
+                            continue  # 同名工具本请求已展示过
+                        shown_start.add(name)
                         inp = {
                             k: v for k, v in (event["data"].get("input") or {}).items()
                             if k != "user_id"  # 对前端隐藏内部用户标识
@@ -258,34 +301,42 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                         if step_id is not None:
                             ev["step_id"] = step_id
                         yield ev
-                    elif etype == "on_tool_end" and name in tool_names and name not in ended:
-                        ended.add(name)
+                    elif etype == "on_tool_end" and name in tool_names:
                         out = event["data"].get("output")
+                        end_inp = {
+                            k: v for k, v in (event["data"].get("input") or {}).items()
+                            if k != "user_id"
+                        }
+                        key = (name, json.dumps(end_inp, ensure_ascii=False, sort_keys=True,
+                                                default=str))
+                        if key not in recorded:
+                            recorded.add(key)
+                            tool_records.append({
+                                "name": pretty_tool_name(name),
+                                "input": json.dumps(end_inp, ensure_ascii=False, default=str)[:1000],
+                                "output": json.dumps(out, ensure_ascii=False, default=str)[:1000],
+                            })
+                            if pretty_tool_name(name) == "search_course_documents":
+                                nonlocal retrieval_sources
+                                retrieval_sources = _extract_sources(out)
+                        if name in shown_end:
+                            continue  # 同名工具本请求已展示过结束态
+                        shown_end.add(name)
                         ev = {"type": "tool_end", "name": pretty_tool_name(name),
                               "output": json.dumps(out, ensure_ascii=False, default=str)[:500]}
                         if step_id is not None:
                             ev["step_id"] = step_id
                         yield ev
-                        end_inp = {
-                            k: v for k, v in (event["data"].get("input") or {}).items()
-                            if k != "user_id"
-                        }
-                        tool_records.append({
-                            "name": pretty_tool_name(name),
-                            "input": json.dumps(end_inp, ensure_ascii=False, default=str)[:1000],
-                            "output": json.dumps(out, ensure_ascii=False, default=str)[:1000],
-                        })
-                        if pretty_tool_name(name) == "search_course_documents":
-                            nonlocal retrieval_sources
-                            retrieval_sources = _extract_sources(out)
                     else:
                         yield {"_raw": event}  # 交由调用方处理文本流
 
+            # 规划对象暂存：run_step 读取已完成步骤结果（跨步骤上下文传递）
+            plan_holder: dict = {}
+
             # ---------- direct：单循环（事件入队，由生成器 drain） ----------
             async def run_direct() -> None:
-                started, ended = _fresh_sets()
                 async for ev in forward_tool_events(
-                    agent.astream_events(agent_input, version="v2"), started, ended
+                    agent.astream_events(agent_input, version="v2")
                 ):
                     if ev.get("_raw") is not None:
                         event = ev["_raw"]
@@ -298,6 +349,22 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                         await sink(ev)
 
             # ---------- plan：规划执行（审批发生在 run_step 深处） ----------
+            def _completed_steps_summary(current_id: int) -> str:
+                """已完成步骤的结果注入指令——后步复用前步产出，不再重复查询。"""
+                plan: Plan | None = plan_holder.get("plan")
+                if plan is None:
+                    return ""
+                parts = []
+                for s in plan.steps:
+                    if s.id != current_id and s.status == "done" and s.result:
+                        parts.append(f"- {s.title}：{s.result[:400]}")
+                if not parts:
+                    return ""
+                return (
+                    "\n已完成步骤的结果（直接引用，禁止重复调用相同工具）：\n"
+                    + "\n".join(parts)
+                )
+
             async def run_step(step: PlanStep) -> str:
                 """执行计划中的单步；返回文本结果，用户拒绝写操作则抛 ApprovalDenied。"""
                 token = current_step_id.set(step.id)  # 审批拒绝归属到本步骤
@@ -306,14 +373,15 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                         f"你正在执行一个多步计划中的一步（总目标：{payload.message}）。\n"
                         f"本步目标：{step.goal}\n"
                         + (f"建议使用的工具：{step.tool_hint}\n" if step.tool_hint else "")
-                        + "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
+                        + _completed_steps_summary(step.id) + "\n"
+                        + "规则：若已完成步骤的结果中已包含保存成功的信息，禁止重复保存；"
+                        "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
                     )
-                    started, ended = _fresh_sets()
                     chunks: list[str] = []
                     step_input = {"messages": history_msgs + [HumanMessage(content=instruction)]}
                     async for ev in forward_tool_events(
                         agent.astream_events(step_input, version="v2"),
-                        started, ended, step_id=step.id,
+                        step_id=step.id,
                     ):
                         if ev.get("_raw") is not None:
                             event = ev["_raw"]
@@ -349,6 +417,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                         retries=1, base_delay=0.5,
                     )
                     plan = Plan(steps=steps)
+                    plan_holder["plan"] = plan  # 供 run_step 读取前序步骤结果
                 except Exception as exc:  # noqa: BLE001
                     await sink({"type": "fallback", "to": "direct",
                                 "reason": f"规划失败：{type(exc).__name__}: {exc}"})
@@ -408,6 +477,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                     await run_direct()
                     return {"mode_used": "direct", "plan_meta": None, "degraded": False}
                 task = asyncio.create_task(_direct_flow())
+            _register_run(run_id, current_user.id, task)
 
             # ---------- drain 队列 → SSE（任务完成且队列排空后退出） ----------
             while True:
@@ -425,7 +495,38 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
                 yield _sse(evt)
 
             # 任务异常 → 错误事件（由外层 except 统一处理）
-            result = task.result()
+            # 用户主动取消 → CancelledError（BaseException，不会被外层 except Exception 捕获）
+            try:
+                result = task.result()
+            except asyncio.CancelledError:
+                answer = "".join(collected_text)
+                latency = int((time.perf_counter() - started_at) * 1000)
+                # 保留已生成的部分内容（用户可能需要），标记为已停止
+                if answer:
+                    answer += "\n\n（已手动停止）"
+                db.add(AiMessage(conversation_id=conversation.id, role="user", content=payload.message))
+                db.add(
+                    AiMessage(
+                        conversation_id=conversation.id,
+                        role="assistant",
+                        content=answer,
+                        latency_ms=latency,
+                        first_token_ms=first_token_ms,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cost_cny=usage.cost_cny,
+                    )
+                )
+                db.commit()
+                yield _sse(
+                    {
+                        "type": "cancelled",
+                        "conversation_id": conversation.id,
+                        "latency_ms": latency,
+                        "partial_chars": len(answer),
+                    }
+                )
+                return
 
             answer = "".join(collected_text)
             latency = int((time.perf_counter() - started_at) * 1000)
@@ -482,6 +583,7 @@ async def chat(payload: ChatRequest, current_user: User = Depends(get_current_us
         finally:
             if task is not None and not task.done():
                 task.cancel()  # 客户端断开等中断场景：停止后台执行
+            _unregister_run(run_id)
             db.close()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
