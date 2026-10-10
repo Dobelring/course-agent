@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import {
@@ -9,6 +9,7 @@ import {
   deleteConversation,
   fetchConversation,
   fetchConversations,
+  resolveApproval,
 } from '../api'
 
 const props = defineProps({
@@ -59,6 +60,27 @@ const STEP_STATUS = {
 
 function stepMeta(status) {
   return STEP_STATUS[status] || STEP_STATUS.pending
+}
+
+// 写操作审批：弹确认框，决策经独立接口回传（SSE 流继续读取，不阻塞）
+async function handleApproval(ev, assistant) {
+  assistant.notices.push(`⏳ 等待确认：是否执行「${ev.tool}」？（${ev.timeout_s} 秒内有效）`)
+  let approve = false
+  try {
+    await ElMessageBox.confirm(
+      `工具「${ev.tool}」将写入数据：\n${ev.args}`,
+      '需要你的授权',
+      { confirmButtonText: '允许执行', cancelButtonText: '拒绝', type: 'warning' },
+    )
+    approve = true
+  } catch {
+    approve = false // 取消/右上角关闭均视为拒绝
+  }
+  try {
+    await resolveApproval(ev.approval_id, approve, props.token)
+  } catch (e) {
+    ElMessage.warning(e.message)
+  }
 }
 
 // 助手回答按 Markdown 渲染（表格/加粗/列表），DOMPurify 防 XSS
@@ -160,6 +182,15 @@ async function doSend(text) {
           if (ev.compressed) {
             assistant.value.notices.push(`已将更早的 ${ev.summary_chars} 字历史压缩为摘要`)
           }
+          break
+        case 'approval_required':
+          // 不阻塞读流：弹窗确认后异步回传决策，服务器会一直等（带超时）
+          handleApproval(ev, assistant.value)
+          break
+        case 'approval_resolved':
+          assistant.value.notices.push(
+            ev.approved ? `✓ 已授权执行「${ev.tool}」` : `✗ 已拒绝「${ev.tool}」（${ev.reason}）`,
+          )
           break
         case 'plan':
           assistant.value.plan = { steps: ev.steps, revised: 0, degraded: false }
