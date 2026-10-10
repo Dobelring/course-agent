@@ -40,3 +40,9 @@
 {"id": "r28", "type": "retrieval", "query": "哪些排序算法是稳定的，哪些不稳定", "expected_doc": "数据结构复习提纲.md", "difficulty": "hard"}
 {"id": "r29", "type": "retrieval", "query": "写信类应用文的格式有什么要求", "expected_doc": "大学英语四六级写作指南.md", "difficulty": "hard"}
 {"id": "r30", "type": "retrieval", "query": "拉格朗日中值定理和罗尔定理是什么关系", "expected_doc": "高等数学极限与导数专题.md", "difficulty": "hard"}
+{"id": "p01", "type": "plan", "query": "对比我这学期所有科目的成绩和作业完成情况，找出最需要补救的科目，并生成一份为期两周的补救学习计划保存下来", "expected_tools": ["get_my_scores", "get_upcoming_assignments", "save_study_plan"], "expect_complex": true}
+{"id": "p02", "type": "plan", "query": "先查我今天的课表，再看看这周有哪些作业要交，然后根据两者的空闲时间帮我安排今天的复习计划并保存", "expected_tools": ["get_my_schedule", "get_upcoming_assignments", "save_study_plan"], "expect_complex": true}
+{"id": "p03", "type": "plan", "query": "我上传的资料里关于排序算法是怎么讲的？结合我的成绩分析我数据结构这门课该怎么复习，给出计划并保存", "expected_tools": ["search_course_documents", "get_my_scores", "save_study_plan"], "expect_complex": true}
+{"id": "p04", "type": "plan", "query": "帮我把下周的学习安排规划一下：先看课表避开上课时间，再看作业截止日，最后查一下成绩最弱的科目优先复习，写成计划保存", "expected_tools": ["get_my_schedule", "get_upcoming_assignments", "get_my_scores", "save_study_plan"], "expect_complex": true}
+{"id": "p05", "type": "plan", "query": "我 GPA 是多少，哪门课最弱？", "expected_tools": ["get_my_scores"], "expect_complex": false}
+{"id": "p06", "type": "plan", "query": "周四下午我有课吗", "expected_tools": ["get_my_schedule"], "expect_complex": false}

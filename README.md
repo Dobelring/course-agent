@@ -23,8 +23,11 @@ flowchart LR
 
     subgraph 后端["FastAPI"]
         API[REST API<br/>JWT 鉴权 / 角色隔离]
-        CHAT[SSE 流式聊天]
-        AGENT["LangChain Agent<br/>（OpenAI 兼容 · 默认千问）"]
+        CHAT[SSE 流式聊天<br/>auto / direct / plan 三模式]
+        ROUTE{"复杂度分类"}
+        AGENT["单循环 Agent<br/>（OpenAI 兼容 · 默认千问）"]
+        PLAN["Plan-and-Execute<br/>拆解 → 逐步执行 → 重规划 → 综合"]
+        CTX["上下文管理<br/>预算切分 + 摘要压缩"]
         MCP["MCP Server（stdio 子进程）<br/>6 个工具"]
         RAG["RAG 管线<br/>切片 → 向量化 → 余弦检索"]
         DB[("MySQL<br/>9 张业务表")]
@@ -32,7 +35,11 @@ flowchart LR
 
     S --> API
     A --> API
-    API --> CHAT --> AGENT
+    API --> CHAT --> CTX
+    CHAT --> ROUTE
+    ROUTE -->|简单| AGENT
+    ROUTE -->|复杂| PLAN
+    PLAN --> AGENT
     CHAT -->|stream_events| S
     AGENT -->|MCP 协议| MCP
     MCP --> DB
@@ -44,10 +51,11 @@ flowchart LR
 
 - **MCP 工具层与 Agent 解耦**：业务能力封装为独立 MCP Server（stdio 子进程），Agent 通过协议调用，工具可独立复用
 - **多租户身份强制绑定**：`UserBoundTool` 包装层无论模型传入什么 `user_id`，执行前一律覆盖为当前登录用户，从协议层面杜绝越权（水平越权返回 404）
+- **三模式路由（auto/direct/plan）**：auto 模式先用轻量分类判断复杂度——简单问题走单循环，复杂任务走 **Plan-and-Execute**：LLM 拆解为结构化步骤 → 逐步执行（每步失败先指数退避重试）→ 重试耗尽把失败上下文喂回 LLM **重规划** → 流式综合产出；规划失败自动降级单循环，保证有回答
+- **两级上下文管理**：历史超字符预算（默认 8000）时，旧消息（含上轮摘要）由 LLM 压缩为工作摘要持久化在会话上，近期消息保留原文——形成「摘要 + 近期原文」的长期记忆
 - **RAG 个人知识库**：学生上传资料自动切片/向量化入库，检索按 `user_id` 过滤，Agent 回答附带溯源（文件名/切片/相似度）
-- **多轮记忆**：会话历史最近 20 条拼入 Agent 输入，支持「这门课的老师是谁」类代词追问
 - **日期感知**：系统提示注入当前日期与教学周，Agent 可换算「今天/明天/下周一」并判断周次范围内是否上课
-- **观测性**：每条回答落库首字耗时/总耗时/工具调用痕迹/检索溯源，学生端仪表盘与后台统计可视化
+- **观测性**：每条回答落库首字耗时/总耗时/工具调用痕迹/检索溯源/规划元数据（步骤状态、重规划次数、是否降级），学生端仪表盘与后台统计可视化
 
 ## 功能
 
@@ -124,13 +132,13 @@ Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · L
 
 ## 测试
 
-后端内置 **77 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具与 API 集成，全部离线可跑（无需 API Key）：
+后端内置 **117 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩）与 API 集成，全部离线可跑（无需 API Key）：
 
 ```bash
 cd backend
 pip install -r requirements-dev.txt
-python -m pytest                          # 全量（约 10 秒）
-python -m pytest tests/test_user_binding.py -v   # 单文件
+python -m pytest                          # 全量（约 30 秒）
+python -m pytest tests/test_planner.py -v # 单文件
 ```
 
 | 测试文件 | 覆盖内容 |
@@ -140,18 +148,24 @@ python -m pytest tests/test_user_binding.py -v   # 单文件
 | `test_indexer.py` | 分块长度约束、内容不丢、入库置 ready、空文档置 failed |
 | `test_mcp_tools.py` | 6 个 MCP 工具直调：GPA 加权计算、逾期作业窗口、跨用户数据隔离 |
 | `test_security.py` | 密码哈希盐值、JWT 签发/过期/错误密钥拒绝、admin 角色守卫、绩点换算 20 个边界值 |
+| `test_resilience.py` | 指数退避重试：瞬时故障恢复、次数耗尽抛出、不可重试异常直抛、退避序列 1s→2s→4s |
+| `test_context.py` | 上下文预算切分、超预算摘要压缩、旧摘要合并进新摘要、预算内不触发 |
+| `test_planner.py` | 复杂度分类（失败降级 simple）、JSON 容错与一次修复、计划步数上限、重规划带失败上下文 |
+| `test_plan_executor.py` | 执行循环：单步重试、失败重规划、重规划耗尽降级、部分成功仍综合、综合失败回退拼接 |
+| `test_chat_modes.py` | 模式路由 SSE 事件序列、plan 元数据落库、规划失败降级 direct、摘要持久化 |
 | `test_api.py` | 登录注册、课表/计划/会话跨用户 404、学生访问管理接口 403、`/chat` 无 Key 时 SSE 优雅报错 |
 
 每个用例使用独立 SQLite 测试库并在前后重建表，用例之间完全隔离。
 
 ## 评测（Evaluation）
 
-基于黄金评测集量化 RAG 检索质量与 Agent 工具选择准确率：语料为 5 篇课程文档，评测集含 30 条检索查询 + 12 条工具选择查询：
+基于黄金评测集量化 RAG 检索、工具选择与任务规划三层质量：语料为 5 篇课程文档，评测集含 30 条检索 + 12 条工具选择 + 6 条规划查询：
 
 ```bash
 cd backend
 python scripts/eval.py retrieval   # 检索评测（离线，无需 Key）
 python scripts/eval.py tools       # 工具选择评测（需 LLM_API_KEY）
+python scripts/eval.py plan        # 规划质量评测（需 Key）
 python scripts/eval.py all         # 全部
 ```
 
@@ -174,3 +188,13 @@ python scripts/eval.py all         # 全部
 | 工具命中率 | **100.00%（12/12）** |
 
 12 条指令覆盖全部 6 个工具。评测同时观察到：复杂指令（t10/t11「制定计划并保存」）会触发多工具串行调用（查课表 → 查成绩 → 查作业 → 查资料 → 保存计划），单工具指令则平均一次命中——说明模型在简单意图下没有过度调用。
+
+**规划质量评测实测结果**（qwen3.8-flash，6 条查询：4 复杂 + 2 简单）：
+
+| 指标 | 结果 |
+|---|---|
+| 复杂度分类准确率 | **83.33%（5/6）** |
+| 计划工具覆盖率（均值） | **100.00%** |
+| 完全覆盖率 | **100.00%（6/6）** |
+
+分类的唯一 miss：p05「我 GPA 是多少，哪门最弱？」被判为复杂（实际单次 `get_my_scores` 即可）——分类器对「含比较但单工具可答」的边界情形偏保守。工具覆盖 100% 表示 4 条复杂查询拆出的计划均包含全部期望工具，规划阶段不会漏工具。

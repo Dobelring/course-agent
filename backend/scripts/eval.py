@@ -1,12 +1,13 @@
-r"""评测脚本：检索质量（离线）+ 工具选择准确率（需 LLM_API_KEY）。
+r"""评测脚本：检索质量（离线）+ 工具选择/规划质量（需 LLM_API_KEY）。
 
 用法（backend 目录）：
-    python scripts/eval.py retrieval      # 仅检索评测，无需 API Key
-    python scripts/eval.py tools          # 仅工具选择评测，需要 LLM_API_KEY
-    python scripts/eval.py all            # 两者都跑
+    python scripts/eval.py retrieval      # 检索评测，无需 API Key
+    python scripts/eval.py tools          # 工具选择评测，需要 LLM_API_KEY
+    python scripts/eval.py plan           # 规划质量评测（分类+拆解），需要 Key
+    python scripts/eval.py all            # 全部
 
-检索评测指标：Hit@1、Hit@3、MRR（基于 data/eval/eval_set.jsonl 黄金集）。
-工具评测指标：工具命中率（期望工具是否出现在模型实际调用中）。
+检索指标：Hit@1、Hit@3、MRR。工具指标：工具命中率。
+规划指标：复杂度分类准确率、计划工具覆盖率、完全覆盖率。
 语料：data/eval/corpus/ 下 5 份文档，独立评测用户 eval_user，不污染业务数据。
 """
 from __future__ import annotations
@@ -262,9 +263,78 @@ async def run_tool_eval() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 规划质量评测（需 LLM）：分类准确率 + 计划工具覆盖率
+# ---------------------------------------------------------------------------
+async def run_plan_eval() -> dict:
+    """对 plan 类用例：① 复杂度分类是否正确 ② 拆解计划是否覆盖期望工具。"""
+    from app.agent.engine import build_llm
+    from app.agent.planner import classify_complexity, create_plan
+    from app.config import settings
+
+    if not settings.llm_api_key:
+        print("\n[跳过] 未配置 LLM_API_KEY，规划评测需要真实模型。")
+        return {"skipped": True}
+
+    llm = build_llm()
+    cases = load_cases("plan")
+    tools = ["get_my_schedule", "search_course_documents", "list_my_documents",
+             "save_study_plan", "get_upcoming_assignments", "get_my_scores"]
+
+    cls_correct = 0
+    coverage_sum = 0.0
+    plan_ok = 0
+    details: list[dict] = []
+
+    print(f"\n== 规划评测（{len(cases)} 条查询）==\n")
+    print(f"{'ID':<5} {'分类':<4} {'工具覆盖':<8} 查询")
+    print("-" * 78)
+
+    for case in cases:
+        is_complex, reason = await classify_complexity(llm, case["query"])
+        cls_hit = int(is_complex == case["expect_complex"])
+        cls_correct += cls_hit
+
+        steps = await create_plan(llm, case["query"], tools,
+                                  context="", max_steps=settings.agent_max_steps)
+        planned_tools = {s.tool_hint for s in steps if s.tool_hint}
+        expected = set(case["expected_tools"])
+        coverage = len(expected & planned_tools) / len(expected) if expected else 1.0
+        coverage_sum += coverage
+        if coverage == 1.0:
+            plan_ok += 1
+
+        details.append({
+            "id": case["id"], "query": case["query"],
+            "expect_complex": case["expect_complex"], "got_complex": is_complex,
+            "classify_hit": bool(cls_hit),
+            "expected_tools": sorted(expected), "planned_tools": sorted(planned_tools),
+            "coverage": round(coverage, 4),
+            "steps": [s.title for s in steps],
+        })
+        mark_c = "✓" if cls_hit else "✗"
+        mark_t = "✓" if coverage == 1.0 else ("~" if coverage > 0 else "✗")
+        print(f"{case['id']:<5} {mark_c:<4} {mark_t} {coverage:.0%}      {case['query'][:32]}")
+
+    n = len(cases)
+    metrics = {
+        "queries": n,
+        "classify_accuracy": round(cls_correct / n, 4),
+        "tool_coverage": round(coverage_sum / n, 4),
+        "full_coverage_rate": round(plan_ok / n, 4),
+        "skipped": False,
+        "details": details,
+    }
+    print("-" * 78)
+    print(f"分类准确率 = {metrics['classify_accuracy']:.2%}   "
+          f"平均工具覆盖率 = {metrics['tool_coverage']:.2%}   "
+          f"完全覆盖 = {metrics['full_coverage_rate']:.2%}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 def main() -> int:
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if which not in ("retrieval", "tools", "all"):
+    if which not in ("retrieval", "tools", "plan", "all"):
         print(__doc__)
         return 2
 
@@ -286,6 +356,8 @@ def main() -> int:
             results["retrieval"] = run_retrieval_eval(db, user)
         if which in ("tools", "all"):
             results["tool"] = asyncio.run(run_tool_eval())
+        if which in ("plan", "all"):
+            results["plan"] = asyncio.run(run_plan_eval())
 
         out = BACKEND_DIR / "data" / "eval" / "results.json"
         out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
