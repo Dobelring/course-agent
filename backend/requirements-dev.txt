@@ -1,0 +1,3 @@
+# 测试与评测依赖（生产依赖见 requirements.txt）
+pytest>=8.0
+httpx>=0.27
