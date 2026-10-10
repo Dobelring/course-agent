@@ -32,6 +32,13 @@ class Settings(BaseSettings):
         default="qwen-plus",
         validation_alias=AliasChoices("LLM_MODEL", "DEEPSEEK_MODEL"),
     )
+    # 计价（元/百万 token）：按所用模型官网价配置，用于成本核算展示
+    llm_price_input_per_m: float = Field(
+        default=0.8, validation_alias=AliasChoices("LLM_PRICE_INPUT_PER_M"),
+    )
+    llm_price_output_per_m: float = Field(
+        default=2.0, validation_alias=AliasChoices("LLM_PRICE_OUTPUT_PER_M"),
+    )
 
     # 学期第一周的周一日期（用于推算当前教学周）
     semester_start: str = "2026-09-07"
@@ -47,6 +54,9 @@ class Settings(BaseSettings):
     # 写操作审批（human-in-the-loop）：命中的工具执行前须经 SSE 审批，超时视为拒绝
     agent_approval_tools: str = "save_study_plan"
     agent_approval_timeout: int = 60
+
+    # 跨会话画像：每收到 N 条助手消息刷新一次用户画像（LLM 合并）
+    memory_refresh_every: int = 4
 
     # 检索管线：混合召回（BM25 + 向量 RRF 融合）与交叉编码器重排
     rag_hybrid: bool = True

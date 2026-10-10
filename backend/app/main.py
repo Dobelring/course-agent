@@ -32,6 +32,12 @@ def _ensure_columns() -> None:
          "ALTER TABLE ai_conversations ADD COLUMN summary TEXT"),
         ("ai_messages", "plan",
          "ALTER TABLE ai_messages ADD COLUMN plan TEXT"),
+        ("ai_messages", "input_tokens",
+         "ALTER TABLE ai_messages ADD COLUMN input_tokens INTEGER"),
+        ("ai_messages", "output_tokens",
+         "ALTER TABLE ai_messages ADD COLUMN output_tokens INTEGER"),
+        ("ai_messages", "cost_cny",
+         "ALTER TABLE ai_messages ADD COLUMN cost_cny DOUBLE"),
     ]
     for table, column, ddl in migrations:
         try:

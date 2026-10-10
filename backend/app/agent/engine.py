@@ -2,6 +2,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.tools import BaseTool
@@ -79,7 +80,12 @@ def mcp_client_config() -> dict:
     }
 
 
-def build_llm() -> ChatOpenAI:
+def build_llm(usage: Any = None) -> ChatOpenAI:
+    """构造 LLM。传入 UsageCollector 时挂回调，聚合该实例全部调用的 token 成本。
+
+    注意：一次请求应复用同一个实例（classify/plan/步骤/综合共用），
+    否则用量会分散到多个 collector。
+    """
     if not settings.llm_api_key:
         raise ValueError("未配置 LLM_API_KEY，请在 backend/.env 中填写")
     return ChatOpenAI(
@@ -88,6 +94,7 @@ def build_llm() -> ChatOpenAI:
         base_url=settings.llm_base_url,
         temperature=0.3,
         streaming=True,
+        callbacks=[usage] if usage is not None else None,
     )
 
 
@@ -121,16 +128,17 @@ def build_system_prompt(user: User) -> str:
     )
 
 
-def build_agent(user: User, tools: list[BaseTool], extra_system: str = ""):
+def build_agent(user: User, tools: list[BaseTool], extra_system: str = "", llm: Any = None):
     """组装 LangGraph 风格的 tool-calling agent（工具已绑定用户身份）。
 
     :param extra_system: 追加到系统提示的内容（如压缩后的对话摘要）。
+    :param llm: 复用外部构造的 LLM（带 UsageCollector 回调）；None 则内部新建。
     """
     prompt = build_system_prompt(user)
     if extra_system:
         prompt += f"\n\n{extra_system}"
     return create_agent(
-        build_llm(),
+        llm if llm is not None else build_llm(),
         tools,
         system_prompt=prompt,
     )

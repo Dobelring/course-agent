@@ -1,7 +1,7 @@
 """AI 对话历史：会话 + 消息（含工具调用痕迹与检索溯源）。"""
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -36,4 +36,8 @@ class AiMessage(Base):
     plan: Mapped[str | None] = mapped_column(Text)
     latency_ms: Mapped[int | None] = mapped_column(Integer)  # 总耗时（请求开始到流式结束）
     first_token_ms: Mapped[int | None] = mapped_column(Integer)  # 首字耗时（到第一个字输出）
+    # Token/成本核算（UsageCollector 聚合该次请求全部 LLM 调用）
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    cost_cny: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
