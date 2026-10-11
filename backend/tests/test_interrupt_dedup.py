@@ -114,6 +114,8 @@ def repeating_agent_env(monkeypatch):
     monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
     monkeypatch.setattr(chat_mod, "build_agent",
                         lambda user, tools, extra_system="", llm=None: RepeatingToolAgent())
+    from conftest import patch_fake_router
+    patch_fake_router(monkeypatch, fake_llm, chat_mod)
     return fake_llm
 
 
@@ -158,6 +160,9 @@ def recording_agent_env(monkeypatch):
     monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
     monkeypatch.setattr(chat_mod, "build_agent",
                         lambda user, tools, extra_system="", llm=None: agent)
+    # run_step 每次尝试直连 get_router 选路——替身固定返回假 LLM
+    from conftest import patch_fake_router
+    patch_fake_router(monkeypatch, fake_llm, chat_mod)
     return fake_llm, agent
 
 

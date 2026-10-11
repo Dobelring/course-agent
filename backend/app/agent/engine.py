@@ -81,21 +81,14 @@ def mcp_client_config() -> dict:
 
 
 def build_llm(usage: Any = None) -> ChatOpenAI:
-    """构造 LLM。传入 UsageCollector 时挂回调，聚合该实例全部调用的 token 成本。
+    """构造 LLM：经主备模型路由选路（优先级/加权/熔断/故障切换见 router.py）。
 
-    注意：一次请求应复用同一个实例（classify/plan/步骤/综合共用），
-    否则用量会分散到多个 collector。
+    传入 UsageCollector 时挂回调，聚合该实例全部调用的 token 成本；
+    路由每次 pick 新建实例并挂同一 collector，用量仍按请求聚合。
     """
-    if not settings.llm_api_key:
-        raise ValueError("未配置 LLM_API_KEY，请在 backend/.env 中填写")
-    return ChatOpenAI(
-        model=settings.llm_model,
-        api_key=settings.llm_api_key,
-        base_url=settings.llm_base_url,
-        temperature=0.3,
-        streaming=True,
-        callbacks=[usage] if usage is not None else None,
-    )
+    from app.agent.router import get_router
+
+    return get_router().pick(usage)[1]
 
 
 def build_system_prompt(user: User) -> str:

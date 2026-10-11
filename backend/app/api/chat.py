@@ -36,6 +36,7 @@ from app.agent.approval import (
 )
 from app.agent.context import ContextPlan, build_context, split_history
 from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_config, pretty_tool_name
+from app.agent.router import get_router
 from app.agent.planner import Plan, PlanStep, classify_complexity, create_plan
 from app.agent.plan_executor import ExecutionResult, execute_plan
 from app.agent.resilience import retry_async
@@ -175,9 +176,11 @@ async def chat(payload: ChatRequest,
             price_input_per_m=settings.llm_price_input_per_m,
             price_output_per_m=settings.llm_price_output_per_m,
         )
-        # 提前校验 Key 配置，失败直接返回错误事件
+        # 提前校验路由配置（Key/主备），失败直接返回错误事件
+        route_holder: dict = {}  # 当前使用的模型路由名（熔断上报 / failover 事件用）
         try:
-            llm = build_llm(usage)
+            _route, llm = get_router().pick(usage)
+            route_holder["name"] = _route.name
         except ValueError as e:
             yield _sse({"type": "error", "message": str(e)})
             return
@@ -340,18 +343,24 @@ async def chat(payload: ChatRequest,
 
             # ---------- direct：单循环（事件入队，由生成器 drain） ----------
             async def run_direct() -> None:
-                async for ev in forward_tool_events(
-                    agent.astream_events(agent_input, version="v2")
-                ):
-                    if ev.get("_raw") is not None:
-                        event = ev["_raw"]
-                        if event.get("event") == "on_chat_model_stream":
-                            chunk = event["data"].get("chunk")
-                            content = chunk.content if chunk else None
-                            if isinstance(content, str) and content:
-                                await sink({"type": "text", "delta": content})
-                    else:
-                        await sink(ev)
+                try:
+                    async for ev in forward_tool_events(
+                        agent.astream_events(agent_input, version="v2")
+                    ):
+                        if ev.get("_raw") is not None:
+                            event = ev["_raw"]
+                            if event.get("event") == "on_chat_model_stream":
+                                chunk = event["data"].get("chunk")
+                                content = chunk.content if chunk else None
+                                if isinstance(content, str) and content:
+                                    await sink({"type": "text", "delta": content})
+                        else:
+                            await sink(ev)
+                except Exception:
+                    # 模型调用失败上报熔断：用户重发请求时自动切到备用路由
+                    if route_holder.get("name"):
+                        get_router().report_failure(route_holder["name"])
+                    raise
 
             # ---------- plan：规划执行（审批发生在 run_step 深处） ----------
             def _completed_steps_summary(current_id: int) -> str:
@@ -371,7 +380,11 @@ async def chat(payload: ChatRequest,
                 )
 
             async def run_step(step: PlanStep) -> str:
-                """执行计划中的单步；返回文本结果，用户拒绝写操作则抛 ApprovalDenied。"""
+                """执行计划中的单步；返回文本结果，用户拒绝写操作则抛 ApprovalDenied。
+
+                每次尝试前重新选路：失败路由已被 report_failure 熔断，重试自动
+                切到备用路由（failover 事件通知前端）——故障切换粒度 = 步骤重试。
+                """
                 token = current_step_id.set(step.id)  # 审批拒绝归属到本步骤
                 try:
                     instruction = (
@@ -382,23 +395,35 @@ async def chat(payload: ChatRequest,
                         + "规则：若已完成步骤的结果中已包含保存成功的信息，禁止重复保存；"
                         "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
                     )
+                    picked, llm_try = get_router().pick(usage)
+                    if route_holder.get("name") and picked.name != route_holder["name"]:
+                        await sink({"type": "failover", "from": route_holder["name"],
+                                    "to": picked.name})
+                    route_holder["name"] = picked.name
+                    step_agent = build_agent(current_user, tools,
+                                             extra_system=extra_system, llm=llm_try)
                     chunks: list[str] = []
                     step_input = {"messages": history_msgs + [HumanMessage(content=instruction)]}
-                    async for ev in forward_tool_events(
-                        agent.astream_events(step_input, version="v2"),
-                        step_id=step.id,
-                    ):
-                        if ev.get("_raw") is not None:
-                            event = ev["_raw"]
-                            if event.get("event") == "on_chat_model_stream":
-                                chunk = event["data"].get("chunk")
-                                content = chunk.content if chunk else None
-                                if isinstance(content, str) and content:
-                                    chunks.append(content)
-                                    await sink({"type": "step_text", "id": step.id,
-                                                "delta": content})
-                        else:
-                            await sink(ev)
+                    try:
+                        async for ev in forward_tool_events(
+                            step_agent.astream_events(step_input, version="v2"),
+                            step_id=step.id,
+                        ):
+                            if ev.get("_raw") is not None:
+                                event = ev["_raw"]
+                                if event.get("event") == "on_chat_model_stream":
+                                    chunk = event["data"].get("chunk")
+                                    content = chunk.content if chunk else None
+                                    if isinstance(content, str) and content:
+                                        chunks.append(content)
+                                        await sink({"type": "step_text", "id": step.id,
+                                                    "delta": content})
+                            else:
+                                await sink(ev)
+                    except Exception:
+                        get_router().report_failure(picked.name)
+                        raise
+                    get_router().report_success(picked.name)
                     if approval.denials_for(step.id):
                         raise ApprovalDenied("用户拒绝执行该写操作")
                     return "".join(chunks)

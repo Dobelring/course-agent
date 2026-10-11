@@ -195,9 +195,38 @@ def auth_headers(client):
     return _login
 
 
+def patch_fake_router(monkeypatch, fake_llm, chat_module=None):
+    """替身模型路由：pick 固定返回假 LLM，熔断上报记录到列表供断言。
+
+    run_step 每次尝试直连 chat_mod.get_router 选路，涉及 chat 的集成测试
+    都需要替换路由（否则会用真配置构造 ChatOpenAI）。
+    """
+    from types import SimpleNamespace
+
+    module = chat_module
+    if module is None:
+        from app.api import chat as module  # noqa: PLC0415
+
+    reported: list[tuple[str, str]] = []
+
+    class _FakeRouter:
+        def pick(self, usage=None):
+            return SimpleNamespace(name="fake-route"), fake_llm
+
+        def report_success(self, name):
+            reported.append(("success", name))
+
+        def report_failure(self, name):
+            reported.append(("failure", name))
+
+    fake = _FakeRouter()
+    monkeypatch.setattr(module, "get_router", lambda: fake)
+    return fake
+
+
 @pytest.fixture
 def fake_agent_env(monkeypatch):
-    """把 LLM 与 Agent 替换为假实现；MCP 工具加载保持真实（无需 Key）。
+    """把 LLM、Agent 与模型路由替换为假实现；MCP 工具加载保持真实（无需 Key）。
 
     原定义在 test_chat_modes.py，因 test_api.py 也要复用而上移到公共夹具。
     """
@@ -208,4 +237,6 @@ def fake_agent_env(monkeypatch):
     monkeypatch.setattr(chat_mod, "build_llm", lambda usage=None: fake_llm)
     monkeypatch.setattr(chat_mod, "build_agent",
                         lambda user, tools, extra_system="", llm=None: FakeAgent())
+    fake_router = patch_fake_router(monkeypatch, fake_llm, chat_mod)
+    fake_llm._fake_router = fake_router  # 供用例断言熔断上报
     return fake_llm

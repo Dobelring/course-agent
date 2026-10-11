@@ -275,6 +275,9 @@ async function doSend(text) {
         case 'degraded':
           assistant.value.notices.push(`⚠ ${ev.reason}`)
           break
+        case 'failover':
+          assistant.value.notices.push(`⚠ 模型调用失败，已切换备用路由：${ev.from} → ${ev.to}`)
+          break
         case 'fallback':
           assistant.value.notices.push(`↩ 已降级为直接回答：${ev.reason}`)
           break
