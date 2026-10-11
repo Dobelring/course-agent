@@ -41,6 +41,7 @@ from app.agent.plan_executor import ExecutionResult, execute_plan
 from app.agent.resilience import retry_async
 from app.agent.usage import UsageCollector
 from app.config import settings
+from app.core.ratelimit import limit_chat
 from app.core.security import get_current_user
 from app.database import SessionLocal
 from app.models.conversation import AiConversation, AiMessage
@@ -161,7 +162,9 @@ async def cancel_run(
 
 
 @router.post("")
-async def chat(payload: ChatRequest, current_user: User = Depends(get_current_user)):
+async def chat(payload: ChatRequest,
+               current_user: User = Depends(get_current_user),
+               _rl: None = Depends(limit_chat())):
     async def gen():
         started_at = time.perf_counter()
         first_token_ms = None  # 第一个字输出时的耗时

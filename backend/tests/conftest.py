@@ -13,6 +13,9 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
 os.environ["LLM_API_KEY"] = ""
 # 单测关闭交叉编码器重排（避免下载模型）；混合召回保持开启以覆盖 RRF 逻辑
 os.environ["RAG_RERANK"] = "false"
+# 单测关闭限流（用例高频调用 chat/login；限流逻辑由 test_ratelimit 专门覆盖）
+os.environ["RATE_LIMIT_CHAT_PER_MIN"] = "0"
+os.environ["RATE_LIMIT_LOGIN_PER_MIN"] = "0"
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import bcrypt  # noqa: E402

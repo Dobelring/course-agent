@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     llm_price_output_per_m: float = Field(
         default=2.0, validation_alias=AliasChoices("LLM_PRICE_OUTPUT_PER_M"),
     )
+    # 多模型路由（主备）：JSON 数组，按 priority 升序为主备顺序，同级按 weight 加权分流。
+    # 留空则用上面 llm_api_key/llm_base_url/llm_model 构造单路由（向后兼容）。
+    # 每项：{"name","base_url","model","api_key"(可空,回退 llm_api_key),"priority","weight"}
+    llm_routes: str = Field(default="", validation_alias=AliasChoices("LLM_ROUTES"))
+    # 熔断：同一路由连续失败 N 次后熔断（跳过该路由），冷却 cooldown 秒后半开探测
+    llm_breaker_threshold: int = 2
+    llm_breaker_cooldown_s: int = 30
 
     # 学期第一周的周一日期（用于推算当前教学周）
     semester_start: str = "2026-09-07"
@@ -54,6 +61,19 @@ class Settings(BaseSettings):
     # 写操作审批（human-in-the-loop）：命中的工具执行前须经 SSE 审批，超时视为拒绝
     agent_approval_tools: str = "save_study_plan"
     agent_approval_timeout: int = 60
+    # 三态审批：单步最多「修改后执行」轮数（用户给修改意见 → 模型调整后重新发起审批）
+    agent_approval_max_revises: int = 2
+
+    # 反思环节：综合产出后自检质量（1-5 分），低于阈值且给出修订则替换答案
+    agent_reflect: bool = True
+    agent_reflect_min_quality: int = 3
+
+    # 工具幂等：save_study_plan 按 (user, 内容指纹) 在窗口期内去重，窗口内重复保存返回既有计划
+    tool_idempotency_window_s: int = 600
+
+    # 限流（每分钟）：聊天按用户、登录按客户端 IP；0 = 关闭（测试/评测脚本）
+    rate_limit_chat_per_min: int = 10
+    rate_limit_login_per_min: int = 10
 
     # 跨会话画像：每收到 N 条助手消息刷新一次用户画像（LLM 合并）
     memory_refresh_every: int = 4

@@ -14,6 +14,8 @@ class StudyPlan(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     goal: Mapped[str | None] = mapped_column(Text)
     content: Mapped[str] = mapped_column(Text, nullable=False)  # 计划全文（Markdown）
+    # 幂等指纹：sha256(title+goal+items 规范化)。窗口期内同指纹重复保存返回既有计划
+    fingerprint: Mapped[str | None] = mapped_column(String(64))
     # active / completed / archived
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

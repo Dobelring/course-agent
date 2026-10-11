@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.ratelimit import limit_login
 from app.core.security import create_access_token, get_current_user, hash_password, verify_password
 from app.database import get_db
 from app.models.user import User
@@ -10,7 +11,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=Token)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, db: Session = Depends(get_db),
+          _rl: None = Depends(limit_login())):
+    """按客户端 IP 限流（防爆破）；凭据错误统一 401，不区分用户名/密码哪个错。"""
     user = db.query(User).filter(User.username == payload.username).first()
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")

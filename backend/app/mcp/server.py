@@ -78,18 +78,50 @@ def save_study_plan(user_id: int, title: str, goal: str, content: str, items: li
 
     content 为计划全文（Markdown）；items 为拆解后的具体任务条目列表（按执行顺序，
     每条一句话、可勾选完成），学生端会以 checklist 形式展示并统计进度。
+
+    幂等：对 (user_id, title+goal+items 规范化指纹) 在配置窗口期内去重——
+    重试/重规划/模型不听话重复保存时返回既有计划，不产生重复行。
     """
+    import hashlib
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    from app.config import settings
+
     db: Session = SessionLocal()
     try:
-        plan = StudyPlan(user_id=user_id, title=title, goal=goal, content=content, status="active")
+        items_norm = [(t or "").strip() for t in (items or []) if (t or "").strip()]
+        fingerprint = hashlib.sha256(
+            _json.dumps([title, goal, items_norm], ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+        # created_at 由数据库 CURRENT_TIMESTAMP 生成（SQLite 为 UTC），
+        # 窗口起点必须同用 UTC，否则东八区下永远查不到既有计划
+        window_start = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=settings.tool_idempotency_window_s)
+        )
+        existing = (
+            db.query(StudyPlan)
+            .filter(
+                StudyPlan.user_id == user_id,
+                StudyPlan.fingerprint == fingerprint,
+                StudyPlan.created_at >= window_start,
+            )
+            .first()
+        )
+        if existing is not None:
+            n = db.query(StudyPlanItem).filter(StudyPlanItem.plan_id == existing.id).count()
+            return {"id": existing.id, "title": existing.title,
+                    "status": existing.status, "items": n, "deduplicated": True}
+
+        plan = StudyPlan(user_id=user_id, title=title, goal=goal, content=content,
+                         status="active", fingerprint=fingerprint)
         db.add(plan)
         db.commit()
         db.refresh(plan)
         n_items = 0
-        for i, t in enumerate(items or []):
-            t = (t or "").strip()
-            if not t:
-                continue
+        for i, t in enumerate(items_norm):
             db.add(StudyPlanItem(plan_id=plan.id, item_order=i, title=t[:200]))
             n_items += 1
         db.commit()

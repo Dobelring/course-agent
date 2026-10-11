@@ -38,6 +38,8 @@ def _ensure_columns() -> None:
          "ALTER TABLE ai_messages ADD COLUMN output_tokens INTEGER"),
         ("ai_messages", "cost_cny",
          "ALTER TABLE ai_messages ADD COLUMN cost_cny DOUBLE"),
+        ("study_plans", "fingerprint",
+         "ALTER TABLE study_plans ADD COLUMN fingerprint VARCHAR(64)"),
     ]
     for table, column, ddl in migrations:
         try:

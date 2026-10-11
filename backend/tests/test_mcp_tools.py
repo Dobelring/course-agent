@@ -91,3 +91,34 @@ def test_list_my_documents_isolates_users(seeded):
     names1 = [d["filename"] for d in list_my_documents(seeded.users.student1.id)]
     assert set(names1) == {"u1_notes.md", "u1_draft.md"}
     assert [d["filename"] for d in list_my_documents(seeded.users.student2.id)] == ["u2_notes.md"]
+
+
+def test_save_study_plan_idempotent_within_window(db, seeded):
+    """幂等：窗口期内同 (user, 内容指纹) 重复保存返回既有计划，不产生重复行。"""
+    uid = seeded.users.student1.id
+    args = dict(title="期末复习计划", goal="不挂科", content="# 全文",
+                items=["任务1", "任务2"])
+    first = save_study_plan(uid, **args)
+    second = save_study_plan(uid, **args)
+    assert second["id"] == first["id"]
+    assert second["deduplicated"] is True
+    assert db.query(StudyPlan).filter(StudyPlan.user_id == uid).count() == 1
+
+    # 内容不同（items 变化）→ 指纹不同 → 新计划
+    third = save_study_plan(uid, title="期末复习计划", goal="不挂科",
+                            content="# 全文", items=["任务1", "任务2改"])
+    assert third["id"] != first["id"]
+    assert "deduplicated" not in third
+
+
+def test_save_study_plan_idempotency_window_expires(db, seeded, monkeypatch):
+    """窗口过期后同内容再次保存 → 允许新建（窗口由配置控制）。"""
+    from app.config import settings
+
+    uid = seeded.users.student1.id
+    args = dict(title="短期计划", goal="g", content="# c", items=["x"])
+    first = save_study_plan(uid, **args)
+    monkeypatch.setattr(settings, "tool_idempotency_window_s", 0)
+    second = save_study_plan(uid, **args)
+    assert second["id"] != first["id"]
+    assert "deduplicated" not in second

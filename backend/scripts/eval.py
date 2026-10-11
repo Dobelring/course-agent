@@ -30,6 +30,9 @@ from eval_report import merge_results  # noqa: E402
 # 必须在导入任何 app.* 模块（进而实例化 settings）之前设置。
 _EVAL_DB = BACKEND_DIR / "data" / "eval" / "eval.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_EVAL_DB.as_posix()}"
+# 评测连续压测，关闭限流与审批超时等待（审批由脚本自动批准）
+os.environ["RATE_LIMIT_CHAT_PER_MIN"] = "0"
+os.environ["RATE_LIMIT_LOGIN_PER_MIN"] = "0"
 
 EVAL_SET = BACKEND_DIR / "data" / "eval" / "eval_set.jsonl"
 CORPUS_DIR = BACKEND_DIR / "data" / "eval" / "corpus"
