@@ -51,6 +51,40 @@ def load_cases(etype: str) -> list[dict]:
     return [c for c in cases if c["type"] == etype]
 
 
+def _layer_metrics(details: list[dict], ok_fn) -> dict:
+    """按 tag 分层聚合命中率：{layer: {n, hit, rate}}（分层抽样报告）。"""
+    layers: dict[str, dict] = {}
+    for d in details:
+        k = d.get("tag") or "未分类"
+        layer = layers.setdefault(k, {"n": 0, "hit": 0})
+        layer["n"] += 1
+        layer["hit"] += int(bool(ok_fn(d)))
+    return {k: {"n": v["n"], "hit": v["hit"], "rate": round(v["hit"] / v["n"], 4)}
+            for k, v in sorted(layers.items())}
+
+
+def _repeat_count() -> int:
+    """解析 --repeat N（默认 1）：plan/execution 等 LLM 套件的多轮方差采样。"""
+    argv = sys.argv
+    for i, a in enumerate(argv):
+        if a == "--repeat" and i + 1 < len(argv):
+            return max(1, int(argv[i + 1]))
+    return 1
+
+
+def _aggregate_rounds(rounds: list[dict], keys: list[str]) -> dict:
+    """多轮评测聚合：关键指标 mean±std（LLM 非确定性的方差报告）。"""
+    import statistics
+
+    agg: dict = {}
+    for k in keys:
+        vals = [r[k] for r in rounds if not r.get("skipped") and k in r]
+        if vals:
+            agg[k] = {"mean": round(statistics.fmean(vals), 4),
+                      "std": round(statistics.pstdev(vals) if len(vals) > 1 else 0.0, 4)}
+    return agg
+
+
 # ---------------------------------------------------------------------------
 # 评测库准备：建表 + 评测用户 + 语料入库
 # ---------------------------------------------------------------------------
@@ -130,6 +164,7 @@ def run_retrieval_eval(db, user) -> dict:
 
         hits_at_1 = hits_at_3 = 0
         rr_sum = 0.0
+        _ranks: list = []
         misses: list[dict] = []
 
         for case in tier_cases:
@@ -145,6 +180,7 @@ def run_retrieval_eval(db, user) -> dict:
             hit3 = int(rank is not None)
             rr = 1.0 / rank if rank else 0.0
 
+            _ranks.append(rank)
             hits_at_1 += hit1
             hits_at_3 += hit3
             rr_sum += rr
@@ -178,8 +214,29 @@ def run_retrieval_eval(db, user) -> dict:
         grand["rr_sum"] += rr_sum
         grand["n"] += n
         grand["misses"].extend(misses)
+        grand.setdefault("case_rows", []).extend(
+            {"expected_doc": c["expected_doc"], "hit1": h1, "hit3": h3, "rr": rr}
+            for c, h1, h3, rr in zip(
+                tier_cases,
+                [int(x == 1) for x in _ranks],
+                [int(x is not None) for x in _ranks],
+                [1.0 / x if x else 0.0 for x in _ranks],
+            )
+        )
 
     n = grand["n"]
+    by_doc: dict[str, dict] = {}
+    for r in grand.get("case_rows", []):
+        d = by_doc.setdefault(r["expected_doc"], {"n": 0, "hit1": 0, "hit3": 0, "rr": 0.0})
+        d["n"] += 1
+        d["hit1"] += r["hit1"]
+        d["hit3"] += r["hit3"]
+        d["rr"] += r["rr"]
+    all_metrics["by_doc"] = {
+        k: {"n": v["n"], "hit_at_1": round(v["hit1"] / v["n"], 4),
+            "hit_at_3": round(v["hit3"] / v["n"], 4), "mrr": round(v["rr"] / v["n"], 4)}
+        for k, v in sorted(by_doc.items())
+    }
     all_metrics["overall"] = {
         "queries": n,
         "hit_at_1": round(grand["hits_at_1"] / n, 4),
@@ -191,6 +248,8 @@ def run_retrieval_eval(db, user) -> dict:
     print(f"Hit@1 = {all_metrics['overall']['hit_at_1']:.2%}   "
           f"Hit@3 = {all_metrics['overall']['hit_at_3']:.2%}   "
           f"MRR = {all_metrics['overall']['mrr']:.4f}")
+    for k, v in all_metrics["by_doc"].items():
+        print(f"  [{k}] n={v['n']} Hit@1 {v['hit_at_1']:.0%} Hit@3 {v['hit_at_3']:.0%} MRR {v['mrr']:.2f}")
     return all_metrics
 
 
@@ -237,34 +296,46 @@ async def run_tool_eval() -> dict:
         for case in cases:
             called: list[str] = []
             started: set[str] = set()
+            error: str | None = None
 
-            async for event in agent.astream_events(
-                {"messages": [("user", case["query"])]}, version="v2"
-            ):
-                if event.get("event") == "on_tool_start":
-                    name = event.get("name") or ""
-                    if name in tool_names and name not in started:
-                        started.add(name)
-                        called.append(name.split("__")[-1])
+            # 单例容错：模型循环调用触发 GraphRecursionError 等异常
+            # 只判该例失败，不拖垮整个套件
+            try:
+                async for event in agent.astream_events(
+                    {"messages": [("user", case["query"])]}, version="v2"
+                ):
+                    if event.get("event") == "on_tool_start":
+                        name = event.get("name") or ""
+                        if name in tool_names and name not in started:
+                            started.add(name)
+                            called.append(name.split("__")[-1])
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}: {exc}"[:120]
 
             expected = case["expected_tools"]
-        # 判分：期望工具出现在实际调用序列中即算正确
-            hit = any(t in called for t in expected)
+        # 判分：期望工具出现在实际调用序列中即算正确（异常=失败）
+            hit = error is None and any(t in called for t in expected)
             correct += int(hit)
-            details.append({"id": case["id"], "query": case["query"],
-                            "expected": expected, "called": called, "hit": hit})
-            mark = "✓" if hit else "✗"
-            print(f"{case['id']:<5} {mark} 期望={','.join(expected):<28} 实调={','.join(called) or '（无）'}")
+            details.append({"id": case["id"], "query": case["query"], "tag": case.get("tag"),
+                            "expected": expected, "called": called, "hit": hit,
+                            "error": error})
+            mark = "✗!" if error else ("✓" if hit else "✗")
+            note = f" [{error}]" if error else ""
+            print(f"{case['id']:<5} {mark} 期望={','.join(expected):<28} "
+                  f"实调={','.join(called) or '（无）'}{note}")
 
         n = len(cases)
         metrics = {
             "queries": n,
             "tool_accuracy": round(correct / n, 4),
+            "by_layer": _layer_metrics(details, lambda d: d["hit"]),
             "skipped": False,
             "details": details,
         }
         print("-" * 78)
         print(f"工具命中率 = {metrics['tool_accuracy']:.2%}  ({correct}/{n})")
+        for k, v in metrics["by_layer"].items():
+            print(f"  [{k}] {v['hit']}/{v['n']} = {v['rate']:.0%}")
         return metrics
     finally:
         db.close()
@@ -312,7 +383,7 @@ async def run_plan_eval() -> dict:
             plan_ok += 1
 
         details.append({
-            "id": case["id"], "query": case["query"],
+            "id": case["id"], "query": case["query"], "tag": case.get("tag"),
             "expect_complex": case["expect_complex"], "got_complex": is_complex,
             "classify_hit": bool(cls_hit),
             "expected_tools": sorted(expected), "planned_tools": sorted(planned_tools),
@@ -324,11 +395,22 @@ async def run_plan_eval() -> dict:
         print(f"{case['id']:<5} {mark_c:<4} {mark_t} {coverage:.0%}      {case['query'][:32]}")
 
     n = len(cases)
+    by_layer = {}
+    for d in details:
+        layer = by_layer.setdefault(d.get("tag") or "未分类",
+                                    {"n": 0, "cls_hit": 0, "cov": 0.0})
+        layer["n"] += 1
+        layer["cls_hit"] += int(d["classify_hit"])
+        layer["cov"] += d["coverage"]
     metrics = {
         "queries": n,
         "classify_accuracy": round(cls_correct / n, 4),
         "tool_coverage": round(coverage_sum / n, 4),
         "full_coverage_rate": round(plan_ok / n, 4),
+        "by_layer": {k: {"n": v["n"],
+                         "classify_accuracy": round(v["cls_hit"] / v["n"], 4),
+                         "avg_coverage": round(v["cov"] / v["n"], 4)}
+                     for k, v in sorted(by_layer.items())},
         "skipped": False,
         "details": details,
     }
@@ -336,6 +418,8 @@ async def run_plan_eval() -> dict:
     print(f"分类准确率 = {metrics['classify_accuracy']:.2%}   "
           f"平均工具覆盖率 = {metrics['tool_coverage']:.2%}   "
           f"完全覆盖 = {metrics['full_coverage_rate']:.2%}")
+    for k, v in metrics["by_layer"].items():
+        print(f"  [{k}] n={v['n']} 分类 {v['classify_accuracy']:.0%} 覆盖 {v['avg_coverage']:.0%}")
     return metrics
 
 
@@ -345,10 +429,12 @@ async def run_plan_eval() -> dict:
 def seed_execution_data(db, user) -> None:
     """为执行评测播种确定性业务数据（幂等）。
 
-    断言依赖（与 eval_set.jsonl 的 e1-e5 对应）：
-    - 成绩：数据结构 92、高等数学 61 → e1「最弱=高等数学」、e5「92 分」
-    - 课表：周四(weekday=4) 数据结构 → e2「周四=数据结构」
-    - 作业：2 天后截止、标题含「实验」→ e5「实验」
+    断言依赖（与 eval_set.jsonl 的 e1-e10 对应）：
+    - 成绩：数据结构 92、高数 61（保持最弱）、英语 78、机器学习 85
+      → e1「最弱=高数」、e5「92 分」
+    - 课表：周四数据结构 → e2；周一高等数学 → e6；周三大学英语 → e7
+    - 作业：红黑树实验(+2d) → e5「实验」；极限习题集(+3d)；
+      神经网络编程(-1d 已逾期) → e8「逾期」
     """
     from datetime import datetime, timedelta
 
@@ -356,21 +442,37 @@ def seed_execution_data(db, user) -> None:
     from app.models.course import Course, Schedule
     from app.models.score import Score
 
-    if db.query(Score).filter(Score.user_id == user.id).count() >= 2:
-        return  # 已播种（幂等）
+    if db.query(Score).filter(Score.user_id == user.id).count() >= 4:
+        return  # 已播种（幂等；e1-e5 断言依赖的 92/61/周四/实验 均不变）
 
     cs = Course(code="EVAL-CS201", name="数据结构", teacher="王老师", credit=3)
     ma = Course(code="EVAL-MA101", name="高等数学", teacher="赵老师", credit=5)
-    db.add_all([cs, ma])
+    en = Course(code="EVAL-EN101", name="大学英语", teacher="孙老师", credit=2)
+    ml = Course(code="EVAL-ML101", name="机器学习", teacher="李老师", credit=3)
+    db.add_all([cs, ma, en, ml])
     db.flush()
     db.add(Score(user_id=user.id, course_id=cs.id, score=92))
     db.add(Score(user_id=user.id, course_id=ma.id, score=61))
+    db.add(Score(user_id=user.id, course_id=en.id, score=78))
+    db.add(Score(user_id=user.id, course_id=ml.id, score=85))
     db.add(Schedule(user_id=user.id, course_id=cs.id, weekday=4,
                     start_period=5, end_period=6, week_start=1, week_end=16,
                     location="教三201"))
+    db.add(Schedule(user_id=user.id, course_id=ma.id, weekday=1,
+                    start_period=1, end_period=2, week_start=1, week_end=16,
+                    location="教一105"))
+    db.add(Schedule(user_id=user.id, course_id=en.id, weekday=3,
+                    start_period=3, end_period=4, week_start=1, week_end=16,
+                    location="文二楼301"))
     db.add(Assignment(user_id=user.id, course_id=cs.id,
                       title="数据结构实验：红黑树实现",
                       due_at=datetime.now() + timedelta(days=2), status="pending"))
+    db.add(Assignment(user_id=user.id, course_id=ma.id,
+                      title="高等数学作业：极限习题集",
+                      due_at=datetime.now() + timedelta(days=3), status="pending"))
+    db.add(Assignment(user_id=user.id, course_id=ml.id,
+                      title="机器学习作业：神经网络编程",
+                      due_at=datetime.now() - timedelta(days=1), status="pending"))
     db.commit()
     print("执行评测数据已播种：成绩/课表/作业（幂等）")
 
@@ -491,7 +593,8 @@ async def run_execution_eval(db, user) -> dict:
                 checks.append({"name": "请求成功", "ok": False,
                                "note": f"{type(exc).__name__}: {exc}"})
                 details.append({"id": case["id"], "query": case["query"],
-                                "mode": mode, "passed": False, "checks": checks})
+                                "mode": mode, "tag": case.get("tag"),
+                                "passed": False, "checks": checks})
                 print(f"{case['id']:<4} ✗ 请求失败 {checks[0]['note'][:80]}")
                 continue
 
@@ -528,6 +631,7 @@ async def run_execution_eval(db, user) -> dict:
             passed_total += int(passed)
             details.append({
                 "id": case["id"], "query": case["query"], "mode": mode,
+                "tag": case.get("tag"),
                 "passed": passed, "checks": checks,
                 "approvals": len(parsed["approvals"]),
                 "latency_ms": latency_ms,
@@ -563,6 +667,7 @@ async def run_execution_eval(db, user) -> dict:
         "queries": n,
         "passed": passed_total,
         "completion_rate": round(passed_total / n, 4) if n else 0.0,
+        "by_layer": _layer_metrics(details, lambda d: d["passed"]),
         "intervention_rate": round(intervened / n, 4) if n else 0.0,
         "intervened_queries": intervened,
         "approval_decisions": decisions,
@@ -576,6 +681,8 @@ async def run_execution_eval(db, user) -> dict:
           f" / ¥{total_usage['cost_cny']:.4f}")
     print(f"人工干预率 = {metrics['intervention_rate']:.2%}（{intervened}/{n} 轮触发审批），"
           f"决策分布 {decisions}")
+    for k, v in metrics["by_layer"].items():
+        print(f"  [{k}] {v['hit']}/{v['n']} = {v['rate']:.0%}")
     return metrics
 
 
@@ -602,14 +709,29 @@ def main() -> int:
             print(f"语料索引：{len(list(CORPUS_DIR.glob('*.md')))} 篇已就绪，跳过重复索引")
 
         results: dict = {}
+        repeat = _repeat_count()
         if which in ("retrieval", "all"):
             results["retrieval"] = run_retrieval_eval(db, user)
         if which in ("tools", "all"):
             results["tool"] = asyncio.run(run_tool_eval())
         if which in ("plan", "all"):
-            results["plan"] = asyncio.run(run_plan_eval())
+            rounds = [asyncio.run(run_plan_eval()) for _ in range(repeat)]
+            plan_m = dict(rounds[-1])
+            keys = ["classify_accuracy", "tool_coverage", "full_coverage_rate"]
+            plan_m.update({"repeat": repeat,
+                           "mean_std": _aggregate_rounds(rounds, keys)})
+            results["plan"] = plan_m
+            if repeat > 1:
+                print(f"\n[plan 方差] {repeat} 轮：{plan_m['mean_std']}")
         if which in ("execution", "all"):
-            results["execution"] = asyncio.run(run_execution_eval(db, user))
+            rounds = [asyncio.run(run_execution_eval(db, user)) for _ in range(repeat)]
+            exec_m = dict(rounds[-1])
+            keys = ["completion_rate", "intervention_rate"]
+            exec_m.update({"repeat": repeat,
+                           "mean_std": _aggregate_rounds(rounds, keys)})
+            results["execution"] = exec_m
+            if repeat > 1:
+                print(f"\n[execution 方差] {repeat} 轮：{exec_m['mean_std']}")
 
         # 按 suite 合并写入：单跑一个 suite 不会覆盖其他 suite 的历史结果
         out = BACKEND_DIR / "data" / "eval" / "results.json"
