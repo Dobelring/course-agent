@@ -175,8 +175,20 @@ def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict
         reverse=True,
     )
 
+    # ---- 多样性：同一文档最多贡献 rag_max_per_doc 个候选进重排池 ----
+    # 避免 top-k 被同一文档的相邻切片占满，把位置留给其他相关文档
+    cap = max(1, settings.rag_max_per_doc)
+    per_doc: dict[str, int] = {}
+    diverse: list[dict] = []
+    for c in fused_ranked:
+        n = per_doc.get(c["filename"], 0)
+        if n >= cap:
+            continue
+        per_doc[c["filename"]] = n + 1
+        diverse.append(c)
+
     # ---- 重排：融合 top 候选送交叉编码器 ----
-    pool = fused_ranked[: max(settings.rag_rerank_top, top_k)]
+    pool = diverse[: max(settings.rag_rerank_top, top_k)]
     if settings.rag_rerank and len(pool) > top_k:
         try:
             from app.rag.reranker import rerank
@@ -198,14 +210,30 @@ def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict
     )
 
 
+# 相邻合并后单条结果的 content 上限（合并块允许比单块更长，仍是提示词经济性约束）
+_MERGED_CONTENT_CAP = 800
+
+
 def _finalize(order: list[dict], scores: list[float]) -> list[dict]:
-    """统一输出格式：score 为当前排名依据（余弦 / 融合分 / 重排分）。"""
-    return [
-        {
-            "score": round(s, 4),
+    """统一输出格式：score 为当前排名依据（余弦 / 融合分 / 重排分）。
+
+    多样性收尾：同一文档的相邻切片（chunk_index 连续）合并为一条——
+    它们本就是一个连续段落，分开占 top-k 名额只会重复上下文；
+    合并块 content 允许更长（_MERGED_CONTENT_CAP），score 取相邻块中较高者。
+    """
+    merged: list[dict] = []
+    for c, s in zip(order, scores):
+        score = round(s, 4)
+        if (merged and merged[-1]["filename"] == c["filename"]
+                and c["chunk_index"] == merged[-1]["chunk_index"] + 1):
+            prev = merged[-1]
+            prev["content"] = (prev["content"] + "\n" + c["content"])[:_MERGED_CONTENT_CAP]
+            prev["score"] = max(prev["score"], score)
+            continue
+        merged.append({
+            "score": score,
             "filename": c["filename"],
             "chunk_index": c["chunk_index"],
             "content": c["content"][:500],
-        }
-        for c, s in zip(order, scores)
-    ]
+        })
+    return merged

@@ -1,6 +1,7 @@
 """RAG 检索：余弦相似度、按 user_id 隔离、只检索 ready 文档、top-k 截断。"""
 import json
 
+from app.config import settings
 from app.models.document import CourseDocument, DocumentChunk
 from app.rag.retriever import _load_candidates, _vector_scores, cosine, retrieve
 
@@ -23,7 +24,9 @@ def test_retrieve_returns_own_docs_ranked_by_score(db, seeded, monkeypatch):
     # [1,0,0] 的切片应排在 [0,1,0] 之前
     assert results[0]["filename"] == "u1_notes.md"
     assert results[0]["chunk_index"] == 0
-    assert results[0]["score"] > results[-1]["score"]
+    # 相邻切片合并后 score 可能并列（RRF 融合分），按非升序断言
+    assert all(results[i]["score"] >= results[i + 1]["score"]
+               for i in range(len(results) - 1))
 
 
 def test_retrieve_isolates_users(db, seeded, monkeypatch):
@@ -131,3 +134,53 @@ def test_retrieve_prefers_blob_over_json(db, seeded, monkeypatch):
     cands = _load_candidates(db, seeded.users.student1.id)
     c = next(c for c in cands if c["filename"] == "u1_both.md")
     assert c["vec"] == [1.0, 0.0]
+
+
+def test_finalize_merges_adjacent_chunks(db, seeded, monkeypatch):
+    """同一文档相邻切片合并为一条，content 拼接、score 取较高者。"""
+    doc = CourseDocument(user_id=seeded.users.student1.id, filename="u1_series.md",
+                         file_path="/tmp/series.md", file_type="md", status="ready")
+    db.add(doc)
+    db.flush()
+    from app.models.document import DocumentChunk
+    db.add(DocumentChunk(document_id=doc.id, chunk_index=0, content="上半段内容",
+                         embedding="[1.0, 0.0]"))
+    db.add(DocumentChunk(document_id=doc.id, chunk_index=1, content="下半段内容",
+                         embedding="[0.9, 0.1]"))
+    db.commit()
+
+    monkeypatch.setattr("app.rag.retriever.embed_query", lambda q: [1.0, 0.0])
+    monkeypatch.setattr(settings, "rag_max_per_doc", 5)
+    results = retrieve(db, seeded.users.student1.id, "连续内容", top_k=5)
+    series = [r for r in results if r["filename"] == "u1_series.md"]
+    assert len(series) == 1                    # 相邻两条合并为一条
+    assert "上半段内容" in series[0]["content"]
+    assert "下半段内容" in series[0]["content"]
+
+
+def test_per_doc_cap_keeps_results_diverse(db, seeded, monkeypatch):
+    """每文档限流：同一文档的大量切片不会占满 top-k，位置留给其他文档。"""
+    doc = CourseDocument(user_id=seeded.users.student1.id, filename="u1_flood.md",
+                         file_path="/tmp/flood.md", file_type="md", status="ready")
+    db.add(doc)
+    db.flush()
+    from app.models.document import DocumentChunk
+    # 同一文档塞 5 个与查询完全一致的切片
+    for i in range(5):
+        db.add(DocumentChunk(document_id=doc.id, chunk_index=i,
+                             content=f"重复命中{i}", embedding="[1.0, 0.0]"))
+    # 另一文档 1 个次优切片
+    other = CourseDocument(user_id=seeded.users.student1.id, filename="u2_other.md",
+                           file_path="/tmp/o.md", file_type="md", status="ready")
+    db.add(other)
+    db.flush()
+    db.add(DocumentChunk(document_id=other.id, chunk_index=0, content="其他文档",
+                         embedding="[0.8, 0.6]"))
+    db.commit()
+
+    monkeypatch.setattr("app.rag.retriever.embed_query", lambda q: [1.0, 0.0])
+    monkeypatch.setattr(settings, "rag_max_per_doc", 2)
+    results = retrieve(db, seeded.users.student1.id, "多样性", top_k=3)
+    flood = sum(1 for r in results if r["filename"] == "u1_flood.md")
+    assert flood <= 2                          # 限流生效
+    assert any(r["filename"] == "u2_other.md" for r in results)  # 其他文档有位置
