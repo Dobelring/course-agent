@@ -62,3 +62,27 @@ def json_list(raw: str) -> list:
     import json
 
     return json.loads(raw)
+
+
+def test_index_document_rolls_back_on_failure(db, make_users, monkeypatch):
+    """向量化中途失败 → 回滚半成品 chunk，文档状态 failed，异常上抛。"""
+    from app.models.document import CourseDocument, DocumentChunk
+
+    def boom(texts):
+        raise RuntimeError("模型加载失败")
+
+    monkeypatch.setattr("app.rag.indexer.embed_texts", boom)
+    user = make_users.student1
+    doc = CourseDocument(user_id=user.id, filename="x.md", file_path="/tmp/x.md",
+                         file_type="md", status="pending")
+    db.add(doc)
+    db.commit()
+
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        index_document(db, doc, "第一段内容")
+
+    assert doc.status == "failed"
+    # 半成品切片没有残留
+    assert db.query(DocumentChunk).filter(
+        DocumentChunk.document_id == doc.id).count() == 0

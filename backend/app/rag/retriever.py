@@ -11,6 +11,7 @@ bad case），BM25 恰好补上精确词汇匹配；两路互补，RRF 免调权
 中文分词不引 jieba，用「中文二元组 + 英文单词」零依赖切分。
 """
 import json
+import logging
 import math
 import re
 
@@ -19,6 +20,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.document import CourseDocument, DocumentChunk
 from app.rag.embedder import embed_query
+
+logger = logging.getLogger(__name__)
 
 RRF_K = 60  # RRF 常用平滑常数（Cormack et al.）
 
@@ -101,7 +104,12 @@ def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict
     # ---- 候选集：仅保留有向量的切片（重排也需要向量侧候选一致） ----
     candidates: list[dict] = []
     for chunk, filename in rows:
-        vec = json.loads(chunk.embedding or "[]")
+        try:
+            vec = json.loads(chunk.embedding or "[]")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            # 脏数据跳过，不让一条坏切片拖垮整个检索
+            logger.warning("切片向量解析失败，已跳过 chunk_id=%s", chunk.id)
+            continue
         if not vec:
             continue
         candidates.append({
@@ -153,9 +161,13 @@ def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict
                 c["rerank"] = s
             pool.sort(key=lambda c: c["rerank"], reverse=True)
         except Exception:  # noqa: BLE001 — 重排失败回退融合排名，不阻断检索
-            pass
+            # 必须留痕：静默降级会掩盖模型/依赖故障，排障时无从下手
+            logger.warning("重排失败，回退融合排名", exc_info=True)
 
     final = pool[:top_k]
+    logger.info("检索完成 user=%s query=%r 候选=%d 返回=%d 混合=%s 重排=%s",
+                user_id, query[:40], len(candidates), len(final),
+                settings.rag_hybrid, settings.rag_rerank)
     return _finalize(
         final,
         [c.get("rerank", fused[c["chunk_id"]]) for c in final],

@@ -84,6 +84,14 @@ class Settings(BaseSettings):
     rag_recall_k: int = 20      # 每路召回候选数
     rag_rerank_top: int = 10    # 送入重排的候选数（重排后取 top_k）
     rag_rerank_model: str = "BAAI/bge-reranker-v2-m3-int8"
+    rag_rerank_batch: int = 32  # 交叉编码分批大小（控制内存峰值）
+    # 启动预热：lifespan 里加载 embedding/重排模型并跑一次空推理（best-effort）
+    rag_warmup: bool = True
+    # 切片：递归切分目标长度与相邻块重叠（重叠保留跨块上下文）
+    rag_chunk_size: int = 500
+    rag_chunk_overlap: int = 75
+    # 检索结果多样性：同一文档最多贡献的切片数、相邻切片合并
+    rag_max_per_doc: int = 2
 
 
 settings = Settings()

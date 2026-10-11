@@ -62,3 +62,18 @@ def test_retrieve_skips_empty_embedding(db, seeded, monkeypatch):
     # sanity：embedding 存为 JSON 字符串
     chunk = db.query(DocumentChunk).filter(DocumentChunk.content == "无向量").one()
     assert json.loads(chunk.embedding) == []
+
+
+def test_retrieve_skips_corrupt_embedding_json(db, seeded, monkeypatch):
+    """脏 JSON 向量不拖垮检索：坏切片被剔除，其余照常返回。"""
+    doc = CourseDocument(user_id=seeded.users.student1.id, filename="u1_bad.md",
+                         file_path="/tmp/bad.md", file_type="md", status="ready")
+    db.add(doc)
+    db.flush()
+    db.add(DocumentChunk(document_id=doc.id, chunk_index=0,
+                         content="坏向量切片", embedding="{not-json"))
+    db.commit()
+
+    monkeypatch.setattr("app.rag.retriever.embed_query", lambda q: [1.0, 0.0, 0.0])
+    results = retrieve(db, seeded.users.student1.id, "坏向量", top_k=10)
+    assert all(r["filename"] != "u1_bad.md" for r in results)
