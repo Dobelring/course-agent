@@ -54,20 +54,33 @@ def brief_args(args: dict, limit: int = 300) -> str:
 
 
 class ApprovalContext:
-    """单次请求的审批上下文：发事件、等决策、记录拒绝归属。"""
+    """单次请求的审批上下文：发事件、等决策、记录拒绝归属与干预日志。
+
+    决策三态：
+    - approve  → True，工具放行
+    - reject   → False，denials 计数（步骤标记 skipped，不触发重规划）
+    - revise   → 返回用户修改意见（str），由审批门包装成工具结果回给模型——
+                 模型在同一轮内调整参数后重新发起审批，不整步重跑
+    超时未决按拒绝（fail-closed）；revise 次数超上限也转为拒绝（防无限拉扯）。
+    """
 
     def __init__(self, emit: Callable[[dict], Awaitable[None]], *,
-                 timeout: float, user_id: int) -> None:
+                 timeout: float, user_id: int,
+                 max_revises: int = 2,
+                 record: Callable[[dict], None] | None = None) -> None:
         self._emit = emit
         self.timeout = timeout
         self.user_id = user_id
-        self.denials: dict[int | None, int] = {}  # step_id -> 拒绝次数
+        self.max_revises = max_revises
+        self._record = record  # 干预日志回调（chat.py 提供，写 approval_logs）
+        self.denials: dict[int | None, int] = {}   # step_id -> 硬拒绝次数
+        self.revises: dict[int | None, int] = {}   # step_id -> 修改后执行轮数
 
     def denials_for(self, step_id: int | None) -> int:
         return self.denials.get(step_id, 0)
 
-    async def request(self, tool: str, args: dict) -> bool:
-        """请求审批；返回是否批准（超时视为拒绝）。"""
+    async def request(self, tool: str, args: dict) -> bool | str:
+        """请求审批；True=批准 / False=拒绝 / str=用户修改意见。"""
         approval_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -84,30 +97,53 @@ class ApprovalContext:
             "step_id": step_id,
             "timeout_s": int(self.timeout),
         })
+        if self._record is not None:
+            self._record({"kind": "request", "approval_id": approval_id,
+                          "tool": tool, "args": brief_args(args), "step_id": step_id})
+        timed_out = False
         try:
-            approved = await asyncio.wait_for(future, timeout=self.timeout)
-            reason = "" if approved else "用户拒绝"
+            result = await asyncio.wait_for(future, timeout=self.timeout)
         except asyncio.TimeoutError:
-            approved = False
-            reason = "超时未决，按拒绝处理"
+            result = False
+            timed_out = True
         finally:
             PENDING.pop(approval_id, None)
 
+        feedback: str | None = None
+        if result is True:
+            decision, reason, outcome = "approve", "", True
+        elif timed_out:
+            decision, reason, outcome = "timeout", "超时未决，按拒绝处理", False
+        elif result is False:
+            decision, reason, outcome = "reject", "用户拒绝", False
+        else:
+            feedback = str(result).strip()
+            self.revises[step_id] = self.revises.get(step_id, 0) + 1
+            if self.revises[step_id] > self.max_revises:
+                decision, reason, outcome = "reject", "修改次数已用尽，按拒绝处理", False
+            else:
+                decision, reason, outcome = "revise", "用户要求修改后重新提交", feedback
+        if outcome is False and decision in ("reject", "timeout"):
+            self.denials[step_id] = self.denials.get(step_id, 0) + 1
+
+        if self._record is not None:
+            self._record({"kind": "decision", "approval_id": approval_id,
+                          "decision": decision,
+                          "feedback": feedback if decision == "revise" else None})
         await self._emit({
             "type": "approval_resolved",
             "approval_id": approval_id,
             "tool": tool,
-            "approved": approved,
+            "approved": outcome is True,
             "reason": reason,
         })
-        if not approved:
-            self.denials[step_id] = self.denials.get(step_id, 0) + 1
-        return approved
+        return outcome
 
 
-def decide(approval_id: str, approve: bool, user_id: int) -> str | None:
-    """决策入口（供 API 调用）。返回 None 成功，否则返回失败原因。
+def decide(approval_id: str, decision: bool | str, user_id: int) -> str | None:
+    """决策入口（供 API 调用）：True 批准 / False 拒绝 / str 修改意见。
 
+    返回 None 成功，否则返回失败原因。
     线程/循环安全：SSE 流与审批请求可能是两条连接甚至两个事件循环
     （生产 uvicorn 单循环走 set_result；跨循环用 call_soon_threadsafe）。
     """
@@ -123,10 +159,10 @@ def decide(approval_id: str, approve: bool, user_id: int) -> str | None:
     except RuntimeError:
         running = None
     if running is pending.future.get_loop():
-        pending.future.set_result(approve)
+        pending.future.set_result(decision)
     else:
         pending.future.get_loop().call_soon_threadsafe(
-            pending.future.set_result, approve
+            pending.future.set_result, decision
         )
     return None
 
@@ -139,13 +175,19 @@ class ApprovalGateTool(BaseTool):
     pretty_name: str
 
     async def _arun(self, **kwargs: Any) -> str:
-        approved = await self.approval.request(self.pretty_name, kwargs)
-        if not approved:
+        result = await self.approval.request(self.pretty_name, kwargs)
+        if result is True:
+            return await self.underlying.ainvoke(kwargs)
+        if isinstance(result, str):
+            # 修改后执行：意见作为工具结果回给模型，同一轮内调整参数重新发起审批
             return (
-                f"【操作已被用户拒绝】工具 {self.pretty_name} 未执行。"
-                "请告知用户已取消该操作，不要重试。"
+                f"【用户未批准当前参数，要求修改后重新提交】用户意见：{result}\n"
+                "请根据意见调整工具参数后重新调用本工具；若意见无法满足，如实向用户说明。"
             )
-        return await self.underlying.ainvoke(kwargs)
+        return (
+            f"【操作已被用户拒绝】工具 {self.pretty_name} 未执行。"
+            "请告知用户已取消该操作，不要重试。"
+        )
 
     def _run(self, **kwargs: Any) -> str:
         raise RuntimeError("写操作审批依赖异步运行时（_arun），同步路径不应被调用")

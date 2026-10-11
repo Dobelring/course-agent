@@ -245,3 +245,114 @@ def test_denial_does_not_block_other_steps():
     assert statuses["汇报"] == "done"        # 独立步骤不被牵连
     assert result.success is True            # 有完成的步骤
     assert result.steps_done == 2
+
+
+# ---------- 三态审批：修改后执行 ----------
+
+def test_revise_returns_feedback_and_not_denial():
+    """revise 决策返回用户意见（非拒绝），denials 不计数，日志记录 revise。"""
+    events, emit = _collector()
+    logs: list[dict] = []
+
+    async def flow():
+        ctx = ApprovalContext(emit, timeout=5, user_id=1,
+                              max_revises=2, record=logs.append)
+        task = asyncio.create_task(ctx.request("保存学习计划", {"title": "计划"}))
+        for _ in range(100):
+            if PENDING:
+                break
+            await asyncio.sleep(0.01)
+        approval_id = next(iter(PENDING))
+        assert decide(approval_id, "把第2条改具体些", user_id=1) is None
+        return await task, ctx
+
+    outcome, ctx = asyncio.run(flow())
+    assert outcome == "把第2条改具体些"           # 意见回传给审批门 → 模型调整参数
+    assert ctx.denials_for(None) == 0             # revise 不算拒绝
+    kinds = [(l["kind"], l.get("decision")) for l in logs]
+    assert ("request", None) in kinds and ("decision", "revise") in kinds
+    assert logs[-1]["feedback"] == "把第2条改具体些"
+
+
+def test_revise_exceeds_limit_converts_to_reject():
+    """修改轮数超上限 → 转为拒绝（denials 计数，防无限拉扯）。"""
+    events, emit = _collector()
+
+    async def flow():
+        ctx = ApprovalContext(emit, timeout=5, user_id=1, max_revises=1)
+
+        async def request():
+            return await ctx.request("save", {})
+
+        async def decide_when_pending(value: bool | str):
+            for _ in range(100):
+                if PENDING:
+                    break
+                await asyncio.sleep(0.01)
+            decide(next(iter(PENDING)), value, user_id=1)
+
+        task = asyncio.create_task(request())
+        await decide_when_pending("改一次")       # 第 1 次 revise：允许
+        first = await task
+        task2 = asyncio.create_task(request())
+        await decide_when_pending("再改一次")     # 第 2 次 revise：超限 → 拒绝
+        second = await task2
+        return first, second, ctx
+
+    first, second, ctx = asyncio.run(flow())
+    assert first == "改一次"
+    assert second is False
+    assert ctx.denials_for(None) == 1
+    reasons = [e["reason"] for e in events if e["type"] == "approval_resolved"]
+    assert "修改次数已用尽，按拒绝处理" in reasons
+
+
+def test_gate_tool_returns_revise_text_for_model():
+    """审批门收到 revise：不执行底层工具，把修改意见作为工具结果回给模型。"""
+    events, emit = _collector()
+
+    class EchoTool(BaseTool):
+        name: str = "echo"
+        description: str = "echo"
+
+        class Args(BaseModel):
+            text: str
+
+        args_schema: type = Args
+
+        def _run(self, text: str) -> str:
+            return f"executed:{text}"
+
+    gate = ApprovalGateTool(underlying=EchoTool(), approval=None, pretty_name="echo",
+                            name="echo", description="echo", args_schema=EchoTool.Args)
+
+    async def flow():
+        # 用一个假的 approval 对象：request 直接返回 revise 意见
+        class FakeApproval:
+            async def request(self, tool, args):
+                return "把文本改成大写"
+
+        gate.approval = FakeApproval()
+        return await gate._arun(text="abc")
+
+    out = asyncio.run(flow())
+    assert "用户意见：把文本改成大写" in out
+    assert "executed" not in out  # 底层工具未执行
+
+
+def test_decide_accepts_bool_and_str_compat():
+    """decide 同时接受旧 bool 与新三态；未知 id 返回错误。"""
+    events, emit = _collector()
+
+    async def flow():
+        ctx = ApprovalContext(emit, timeout=5, user_id=1)
+        task = asyncio.create_task(ctx.request("save", {}))
+        for _ in range(100):
+            if PENDING:
+                break
+            await asyncio.sleep(0.01)
+        assert decide("no-such", True, user_id=1) == "审批不存在或已过期"
+        decide(next(iter(PENDING)), False, user_id=1)  # 旧式 bool 拒绝
+        return await task
+
+    assert asyncio.run(flow()) is False

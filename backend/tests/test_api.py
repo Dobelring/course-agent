@@ -281,3 +281,48 @@ def test_failed_chat_leaves_no_blank_conversation(
     titles = [c["title"] for c in client.get("/api/conversations",
                                              headers=auth_headers("student1")).json()]
     assert "会不会留下空白会话" not in titles
+
+
+def test_approval_decision_endpoint_formats(client, seeded, auth_headers):
+    """三态决策端点：action 缺失 422、revise 缺意见 422、旧 approve 字段兼容、未知 id 404。"""
+    h1 = auth_headers("student1")
+
+    # action 与 approve 均缺 → 422
+    r = client.post("/api/chat/approvals/no-such", json={}, headers=h1)
+    assert r.status_code == 422
+    # revise 缺修改意见 → 422
+    r = client.post("/api/chat/approvals/no-such",
+                    json={"action": "revise"}, headers=h1)
+    assert r.status_code == 422
+    # 兼容旧格式 {"approve": true}：映射成功，但 id 不存在 → 404
+    r = client.post("/api/chat/approvals/no-such", json={"approve": True}, headers=h1)
+    assert r.status_code == 404
+    # 新格式 action
+    r = client.post("/api/chat/approvals/no-such",
+                    json={"action": "reject"}, headers=h1)
+    assert r.status_code == 404
+
+
+def test_admin_stats_counts_approvals(client, seeded, auth_headers, db):
+    """管理端统计输出审批干预分布（approve/reject/revise/timeout）。"""
+    from app.models.approval import ApprovalLog
+    from datetime import datetime
+
+    admin = auth_headers("admin1")
+    student = auth_headers("student1")
+    # 学生访问管理统计 → 403
+    assert client.get("/api/admin/stats", headers=student).status_code == 403
+
+    db.add_all([
+        ApprovalLog(approval_id="a1", user_id=1, tool="save_study_plan",
+                    decision="approve", decided_at=datetime.now()),
+        ApprovalLog(approval_id="a2", user_id=1, tool="save_study_plan",
+                    decision="revise", feedback="改一下", decided_at=datetime.now()),
+        ApprovalLog(approval_id="a3", user_id=1, tool="save_study_plan"),  # 未决策
+    ])
+    db.commit()
+    stats = client.get("/api/admin/stats", headers=admin).json()
+    assert stats["approvals"] == 3
+    assert stats["approvals_approved"] == 1
+    assert stats["approvals_revised"] == 1
+    assert stats["approvals_rejected"] == 0

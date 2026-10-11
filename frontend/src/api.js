@@ -416,14 +416,15 @@ export async function chatStream(message, token, onEvent, conversationId = null,
 }
 
 /** 写操作审批决策：SSE 流收到 approval_required 后由弹窗调用 */
-export async function resolveApproval(approvalId, approve, token) {
+/** 审批决策：action = approve | reject | revise（revise 须带 feedback 修改意见） */
+export async function resolveApproval(approvalId, action, feedback, token) {
   const res = await fetch(`/api/chat/approvals/${approvalId}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify({ approve }),
+    body: JSON.stringify({ action, feedback: feedback || null }),
   })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))

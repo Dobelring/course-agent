@@ -82,22 +82,21 @@ function stepMeta(status) {
   return STEP_STATUS[status] || STEP_STATUS.pending
 }
 
-// 写操作审批：弹确认框，决策经独立接口回传（SSE 流继续读取，不阻塞）
-async function handleApproval(ev, assistant) {
+// 写操作审批：三态决策（允许 / 拒绝 / 填修改意见后执行）。
+// 不阻塞读流：弹窗是独立状态，决策经独立接口回传（SSE 流继续读取）
+const approvalBox = ref({ visible: false, ev: null, feedback: '' })
+
+function handleApproval(ev, assistant) {
   assistant.notices.push(`⏳ 等待确认：是否执行「${ev.tool}」？（${ev.timeout_s} 秒内有效）`)
-  let approve = false
+  approvalBox.value = { visible: true, ev, feedback: '' }
+}
+
+async function decideApproval(action) {
+  const { ev, feedback } = approvalBox.value
+  if (!ev) return
+  approvalBox.value = { visible: false, ev: null, feedback: '' }
   try {
-    await ElMessageBox.confirm(
-      `工具「${ev.tool}」将写入数据：\n${ev.args}`,
-      '需要你的授权',
-      { confirmButtonText: '允许执行', cancelButtonText: '拒绝', type: 'warning' },
-    )
-    approve = true
-  } catch {
-    approve = false // 取消/右上角关闭均视为拒绝
-  }
-  try {
-    await resolveApproval(ev.approval_id, approve, props.token)
+    await resolveApproval(ev.approval_id, action, feedback.trim(), props.token)
   } catch (e) {
     ElMessage.warning(e.message)
   }
@@ -471,6 +470,34 @@ onMounted(() => {
         </div>
       </div>
     </div>
+
+    <!-- 写操作审批：允许 / 拒绝 / 填修改意见后执行（三态） -->
+    <el-dialog
+      v-model="approvalBox.visible"
+      title="需要你的授权"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <p class="approval-line">工具「{{ approvalBox.ev?.tool }}」将写入数据：</p>
+      <pre class="approval-args">{{ approvalBox.ev?.args }}</pre>
+      <el-input
+        v-model="approvalBox.feedback"
+        type="textarea"
+        :rows="2"
+        placeholder="修改意见（选「修改后执行」时必填；允许/拒绝可不填）"
+      />
+      <template #footer>
+        <el-button type="danger" plain @click="decideApproval('reject')">拒绝</el-button>
+        <el-button
+          type="warning"
+          :disabled="!approvalBox.feedback.trim()"
+          @click="decideApproval('revise')"
+        >
+          修改后执行
+        </el-button>
+        <el-button type="primary" @click="decideApproval('approve')">允许执行</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -906,6 +933,26 @@ onMounted(() => {
 
 .row button.stop-btn {
   background: #dc2626;
+}
+
+/* 审批弹窗内容 */
+.approval-line {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: #1f2937;
+}
+
+.approval-args {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 140px;
+  overflow-y: auto;
+  background: #f9fafb;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #374151;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .error {

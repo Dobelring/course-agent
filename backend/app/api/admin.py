@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.api.documents import extract_text
 from app.core.security import get_current_admin, hash_password
 from app.database import get_db
+from app.models.approval import ApprovalLog
 from app.models.assignment import Assignment
 from app.models.conversation import AiConversation, AiMessage
 from app.models.course import Course, Schedule
@@ -43,6 +44,16 @@ def stats(db: Session = Depends(get_db)):
         "messages": count(AiMessage),
         "assignments": count(Assignment),
         "scores": count(Score),
+        # 人工干预（审批）度量：总请求数 + 各决策分布（approve/reject/revise/timeout）
+        "approvals": db.query(func.count(ApprovalLog.id)).scalar() or 0,
+        "approvals_approved": db.query(func.count(ApprovalLog.id))
+            .filter(ApprovalLog.decision == "approve").scalar() or 0,
+        "approvals_rejected": db.query(func.count(ApprovalLog.id))
+            .filter(ApprovalLog.decision == "reject").scalar() or 0,
+        "approvals_revised": db.query(func.count(ApprovalLog.id))
+            .filter(ApprovalLog.decision == "revise").scalar() or 0,
+        "approvals_timeout": db.query(func.count(ApprovalLog.id))
+            .filter(ApprovalLog.decision == "timeout").scalar() or 0,
     }
 
 

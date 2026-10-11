@@ -18,6 +18,7 @@ import asyncio
 import json
 import time
 import uuid
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -45,6 +46,7 @@ from app.config import settings
 from app.core.ratelimit import limit_chat
 from app.core.security import get_current_user
 from app.database import SessionLocal
+from app.models.approval import ApprovalLog
 from app.models.conversation import AiConversation, AiMessage
 from app.models.user import User
 
@@ -78,7 +80,11 @@ def _unregister_run(run_id: str) -> None:
 
 
 class ApprovalDecision(BaseModel):
-    approve: bool
+    """审批决策：action 三态（approve/reject/revise）；approve 字段兼容旧客户端。"""
+
+    action: Literal["approve", "reject", "revise"] | None = None
+    approve: bool | None = None
+    feedback: str | None = None
 
 
 def _sse(obj: dict) -> str:
@@ -134,12 +140,24 @@ async def resolve_approval(
     payload: ApprovalDecision,
     current_user: User = Depends(get_current_user),
 ):
-    """写操作审批决策：由 SSE 流的消费方在弹窗确认/拒绝后调用。"""
-    err = decide(approval_id, payload.approve, current_user.id)
+    """写操作审批决策：由 SSE 流的消费方在弹窗确认/拒绝/给出修改意见后调用。"""
+    action = payload.action
+    if action is None:
+        if payload.approve is None:
+            raise HTTPException(status_code=422, detail="缺少决策：action 或 approve")
+        action = "approve" if payload.approve else "reject"
+    if action == "revise" and not (payload.feedback or "").strip():
+        raise HTTPException(status_code=422, detail="修改后执行必须填写修改意见")
+    decision: bool | str = (
+        True if action == "approve"
+        else False if action == "reject"
+        else payload.feedback.strip()
+    )
+    err = decide(approval_id, decision, current_user.id)
     if err:
         status = 404 if "不存在" in err else 403
         raise HTTPException(status_code=status, detail=err)
-    return {"ok": True, "approved": payload.approve}
+    return {"ok": True, "action": action}
 
 
 @router.post("/cancel")
@@ -265,8 +283,40 @@ async def chat(payload: ChatRequest,
             async def sink(evt: dict) -> None:
                 await event_queue.put(evt)
 
+            def _record_approval(event: dict) -> None:
+                """审批事件落库（人工干预率度量）：request 插行、decision 更新。
+
+                低频写、逐条 commit——中途断流也不丢审计记录。
+                """
+                try:
+                    if event["kind"] == "request":
+                        db.add(ApprovalLog(
+                            approval_id=event["approval_id"],
+                            user_id=current_user.id,
+                            conversation_id=conversation.id,
+                            tool=event["tool"],
+                            args=event["args"],
+                            step_id=event.get("step_id"),
+                        ))
+                    else:
+                        row = (
+                            db.query(ApprovalLog)
+                            .filter(ApprovalLog.approval_id == event["approval_id"])
+                            .first()
+                        )
+                        if row is not None:
+                            row.decision = event["decision"]
+                            row.feedback = event.get("feedback")
+                            row.decided_at = datetime.now()
+                    db.commit()
+                except Exception:  # noqa: BLE001 — 审计失败绝不阻断对话
+                    logger.warning("审批日志落库失败", exc_info=True)
+                    db.rollback()
+
             approval = ApprovalContext(
                 sink, timeout=settings.agent_approval_timeout, user_id=current_user.id,
+                max_revises=settings.agent_approval_max_revises,
+                record=_record_approval,
             )
             approval_names = {
                 n.strip() for n in settings.agent_approval_tools.split(",") if n.strip()
