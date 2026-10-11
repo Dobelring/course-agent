@@ -191,3 +191,15 @@ def test_first_step_has_no_prior_block(client, seeded, auth_headers, recording_a
     client.post("/api/chat", json={"message": "单步任务走 plan", "mode": "plan"},
                 headers=auth_headers("student1"))
     assert "直接引用" not in agent.instructions[0]
+
+
+def test_write_step_instruction_requires_content_before_approval(
+        client, seeded, auth_headers, recording_agent_env):
+    """写操作授权前必须先流式展示内容：指令层护栏（顺序不能反）。"""
+    _llm, agent = recording_agent_env
+    client.post("/api/chat", json={"message": "规划任务", "mode": "plan"},
+                headers=auth_headers("student1"))
+    assert agent.instructions, "步骤指令未被记录"
+    for ins in agent.instructions:
+        assert "先用可见文本完整展示" in ins
+        assert "再调用写工具发起授权" in ins

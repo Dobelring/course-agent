@@ -9,8 +9,11 @@ from types import SimpleNamespace
 
 _TEST_DB = Path(__file__).resolve().parent / "test_course_agent.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
-# 单元测试不依赖模型服务；/chat 的“未配置 Key”错误分支也依赖此状态
+# 单元测试不依赖模型服务；/chat 的“未配置 Key”错误分支也依赖此状态。
+# LLM_ROUTES 也必须清空：用户的 .env 可能配了带真实 Key 的多路由，
+# 不清空会让路由绕过空 Key 检查，真实调用泄漏进测试环境
 os.environ["LLM_API_KEY"] = ""
+os.environ["LLM_ROUTES"] = ""
 # 单测关闭交叉编码器重排（避免下载模型）；混合召回保持开启以覆盖 RRF 逻辑
 os.environ["RAG_RERANK"] = "false"
 # 单测关闭模型预热（避免测试启动时加载/下载模型）

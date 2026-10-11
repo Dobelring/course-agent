@@ -467,6 +467,8 @@ async def chat(payload: ChatRequest,
                         + (f"建议使用的工具：{step.tool_hint}\n" if step.tool_hint else "")
                         + _completed_steps_summary(step.id) + "\n"
                         + "规则：若已完成步骤的结果中已包含保存成功的信息，禁止重复保存；"
+                        "若本步需要调用写工具（如保存学习计划），必须先用可见文本完整展示"
+                        "将要写入的内容（如计划条目列表），让用户先看到内容，再调用写工具发起授权；"
                         "请完成本步并输出简明结果（一两句即可），不要重复总目标、不要执行其他步骤。"
                     )
                     picked, llm_try = get_router().pick(usage)

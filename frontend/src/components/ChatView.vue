@@ -121,6 +121,7 @@ async function newConversation() {
   // 懒创建：不立即建会话——发送首条消息时后端才创建。
   // 「点了新对话但没发消息」不会在侧栏留下空白会话，切换走自然无残留。
   saveDraft()
+  error.value = '' // 报错只属于触发它的会话，切换即清除
   currentConvId.value = null
   messages.value = []
   restoreDraft()
@@ -129,6 +130,7 @@ async function newConversation() {
 async function openConversation(id) {
   if (busy.value) return
   saveDraft() // 当前会话的未发送草稿留存
+  error.value = '' // 报错只属于触发它的会话，切换即清除
   try {
     const conv = await fetchConversation(props.token, id)
     currentConvId.value = conv.id
@@ -146,6 +148,7 @@ async function removeConversation(id) {
     if (currentConvId.value === id) {
       currentConvId.value = null
       messages.value = []
+      error.value = ''
       restoreDraft()
     }
     await loadConversations()
