@@ -9,7 +9,8 @@ from app.api.chat import _extract_sources
 def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "app": "course-agent"}
+    # redis=False：测试环境 REDIS_URL 为空（未启用）
+    assert resp.json() == {"status": "ok", "app": "course-agent", "redis": False}
 
 
 # ---------- 登录 / 注册 ----------

@@ -22,6 +22,9 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from langchain_core.tools import BaseTool
+from loguru import logger
+
+from app.core import redisbus, redisc
 
 # 计划步骤归属：run_step 内设置，供审批拒绝回传到具体步骤（并行时各任务独立）
 current_step_id: ContextVar[int | None] = ContextVar("current_step_id", default=None)
@@ -41,8 +44,25 @@ class PendingApproval:
 
 
 # 模块级注册表：决策请求与 SSE 流是两条 HTTP 连接，只能经全局表桥接。
-# 单进程 asyncio 单线程，无需加锁；多 worker 部署时需换 Redis（见 README 局限）。
+# Future 无法跨进程——Redis 启用时归属键 appr:{id}（TTL=审批超时+30s）声明
+# 「该审批在哪个 worker 等待」，决策落在别的 worker 时经 Pub/Sub 广播回持有方；
+# 未启用 Redis 时保持单进程语义（见 README 已知局限）。
 PENDING: dict[str, PendingApproval] = {}
+
+
+def _approval_key(approval_id: str) -> str:
+    return redisc.key("appr", approval_id)
+
+
+def _set_approval_key(approval_id: str, owner_id: int, ttl: int) -> None:
+    redisc.try_op(
+        lambda c: c.set(_approval_key(approval_id), owner_id, ex=ttl),
+        what="approval key set",
+    )
+
+
+def _clear_approval_key(approval_id: str) -> None:
+    redisc.try_op(lambda c: c.delete(_approval_key(approval_id)), what="approval key del")
 
 
 def brief_args(args: dict, limit: int = 300) -> str:
@@ -89,6 +109,7 @@ class ApprovalContext:
             approval_id=approval_id, tool=tool, owner_id=self.user_id,
             step_id=step_id, future=future,
         )
+        _set_approval_key(approval_id, self.user_id, int(self.timeout) + 30)
         await self._emit({
             "type": "approval_required",
             "approval_id": approval_id,
@@ -108,6 +129,7 @@ class ApprovalContext:
             timed_out = True
         finally:
             PENDING.pop(approval_id, None)
+            _clear_approval_key(approval_id)
 
         feedback: str | None = None
         if result is True:
@@ -140,10 +162,9 @@ class ApprovalContext:
         return outcome
 
 
-def decide(approval_id: str, decision: bool | str, user_id: int) -> str | None:
-    """决策入口（供 API 调用）：True 批准 / False 拒绝 / str 修改意见。
+def resolve_local(approval_id: str, decision: bool | str, user_id: int) -> str | None:
+    """在本进程内解开审批 Future；返回 None 成功，否则返回失败原因。
 
-    返回 None 成功，否则返回失败原因。
     线程/循环安全：SSE 流与审批请求可能是两条连接甚至两个事件循环
     （生产 uvicorn 单循环走 set_result；跨循环用 call_soon_threadsafe）。
     """
@@ -165,6 +186,46 @@ def decide(approval_id: str, decision: bool | str, user_id: int) -> str | None:
             pending.future.set_result, decision
         )
     return None
+
+
+def decide(approval_id: str, decision: bool | str, user_id: int) -> str | None:
+    """决策入口（供 API 调用）：True 批准 / False 拒绝 / str 修改意见。
+
+    返回 None 成功，否则返回失败原因。
+    本进程持有审批 → 直接解 Future（单 worker 快路径）；不在本进程 →
+    查 Redis 归属键：存在则发布 Pub/Sub 信号给持有 worker（跨进程路径，
+    归属键的存在性与 user_id 双重校验），不存在/Redis 未启用 → 与单进程
+    一致返回「不存在或已过期」（fail-closed）。
+    """
+    if PENDING.get(approval_id) is not None:
+        return resolve_local(approval_id, decision, user_id)
+    owner = redisc.try_op(
+        lambda c: c.get(_approval_key(approval_id)),
+        default=None,
+        what="approval key get",
+    )
+    if owner is None:
+        return "审批不存在或已过期"
+    if int(owner) != user_id:
+        return "无权处理他人的审批"
+    if not redisbus.publish_approval(approval_id, decision, user_id):
+        # 归属键在但信号发不出：Redis 在两次调用之间失效，按不存在处理
+        return "审批不存在或已过期"
+    return None
+
+
+def _on_approval_signal(data: dict) -> None:
+    """Pub/Sub 落地：别的 worker 收到的决策在本进程（持有 Future）执行。"""
+    err = resolve_local(
+        str(data.get("approval_id", "")), data.get("decision", False),
+        int(data.get("user_id", -1)),
+    )
+    if err is not None:
+        # 常见于决策与超时竞态（request 已按超时拒绝）——记 debug 不当错误
+        logger.debug("审批信号落地未命中：{}（{}）", err, data.get("approval_id"))
+
+
+redisbus.set_handler(redisbus.PUBSUB_APPROVAL, _on_approval_signal)
 
 
 class ApprovalGateTool(BaseTool):

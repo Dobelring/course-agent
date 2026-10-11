@@ -1,7 +1,9 @@
 """Agent 编排：连接 MCP 工具 + 强制绑定登录用户 + OpenAI 兼容 LLM（默认千问）。"""
 import asyncio
+import json
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,8 @@ from langchain.agents import create_agent
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
+from loguru import logger
+from pydantic import BaseModel
 
 from app.config import settings
 from app.models.user import User
@@ -19,18 +23,119 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 # MCP 工具列表缓存：spawn 子进程 + 列举工具实测 ~1.5s，全部落在首字之前。
 # 工具 schema 变化频率极低，进程级缓存（单飞 + TTL）把它砍成一次性成本。
+#
+# 三级结构（Redis 启用时）：
+#   L1 进程内对象缓存（热路径，微秒级）
+#   L2 Redis schema 载荷（TTL 同 L1）——别的 worker spawn 一次，本 worker
+#     从载荷重建工具对象（毫秒级），冷启动不再各自 spawn 子进程
+#   单飞锁（SET NX）——跨进程防惊群：只有一个 worker 去 spawn，其余轮询
+#     等载荷出现；等待超时兜底自行 spawn（锁持有者可能已崩溃）
+# 未启用 Redis / 载荷不可序列化（如测试桩返回 dict）→ 只走 L1，行为不变。
 # ---------------------------------------------------------------------------
 
 _tools_cache: list[BaseTool] | None = None
 _tools_cached_at: float = 0.0
 _tools_lock = None  # 惰性创建（进入事件循环后再建，避免跨循环绑定）
 
+_LOCK_TTL_S = 15          # 单飞锁有效期（覆盖 ~1.5s spawn + 余量）
+_LOCK_POLL_S = 0.2        # 未抢到锁时的轮询间隔
+_worker_id = uuid.uuid4().hex[:8]  # 锁值：标识持锁方（观测/排障用）
+
+
+def _payload_redis_key() -> str:
+    from app.core import redisc
+    return redisc.key("mcp-tools", "payload")
+
+
+def _lock_redis_key() -> str:
+    from app.core import redisc
+    return redisc.key("mcp-tools", "lock")
+
+
+def _dump_tools(tools: list) -> str | None:
+    """把工具列表序列化为可跨进程重建的 schema 载荷；任一不可序列化返回 None。
+
+    只存 name/description/inputSchema/annotations——工具的**行为**不序列化，
+    重建时按连接配置重新挂接（调用仍走「每次工具调用 spawn 会话」的既有路径）。
+    """
+    from mcp.types import ToolAnnotations
+
+    items = []
+    for t in tools:
+        if not isinstance(t, BaseTool):
+            return None
+        schema = t.args_schema
+        if isinstance(schema, dict):
+            input_schema = schema
+        elif isinstance(schema, type) and issubclass(schema, BaseModel):
+            input_schema = schema.model_json_schema()
+        else:
+            return None
+        item: dict[str, Any] = {
+            "name": t.name,
+            "description": t.description or "",
+            "inputSchema": input_schema,
+        }
+        md = t.metadata or {}
+        ann = {k: v for k, v in md.items()
+               if k in ToolAnnotations.model_fields and v is not None}
+        if ann:
+            item["annotations"] = ann
+        if "_meta" in md:
+            item["_meta"] = md["_meta"]
+        items.append(item)
+    return json.dumps({"v": 1, "tools": items}, ensure_ascii=False)
+
+
+def _tools_from_payload(payload: str) -> list[BaseTool] | None:
+    """从 schema 载荷重建工具对象；任何失败返回 None（调用方回退 spawn）。"""
+    from langchain_mcp_adapters.tools import convert_mcp_tool_to_langchain_tool
+    from mcp.types import Tool as MCPTool
+
+    try:
+        data = json.loads(payload)
+        connection = mcp_client_config()["course"]
+        return [
+            convert_mcp_tool_to_langchain_tool(
+                None, MCPTool.model_validate(item),
+                connection=connection, server_name="course",
+            )
+            for item in data["tools"]
+        ]
+    except Exception:  # noqa: BLE001 — 载荷脏/版本漂移一律回退 spawn
+        logger.warning("Redis 工具载荷重建失败，回退 spawn 拉取", exc_info=True)
+        return None
+
+
+def _try_redis_payload() -> list[BaseTool] | None:
+    """L2 命中：从 Redis 载荷重建（未启用/异常/未命中返回 None）。"""
+    from app.core import redisc
+
+    payload = redisc.try_op(lambda c: c.get(_payload_redis_key()),
+                            default=None, what="tools payload get")
+    if not payload:
+        return None
+    return _tools_from_payload(payload)
+
+
+async def _wait_redis_payload() -> list[BaseTool] | None:
+    """未抢到单飞锁：轮询等持锁方写入载荷，超时返回 None。"""
+    deadline = time.monotonic() + settings.mcp_tools_lock_wait_s
+    while time.monotonic() < deadline:
+        await asyncio.sleep(_LOCK_POLL_S)
+        tools = _try_redis_payload()
+        if tools is not None:
+            return tools
+    return None
+
 
 async def get_tools_cached() -> list[BaseTool]:
-    """进程级 MCP 工具列表缓存（单飞 + TTL）。
+    """进程级 MCP 工具列表缓存（单飞 + TTL；Redis 启用时升级为两级+分布式单飞）。
 
     - TTL 内直接复用（`mcp_tools_cache_ttl` 秒，0 = 关闭恢复每请求拉取）
     - 并发 miss 用 asyncio.Lock 单飞，避免惊群拉起多个子进程
+    - Redis 启用：先查 L2 载荷；未命中则抢跨进程单飞锁，抢到才 spawn 并
+      回写载荷，没抢到轮询等对方的成果（超时兜底自行 spawn）
     - 注意：工具**调用**仍会新建会话（当前 langchain-mcp-adapters 已移除
       上下文管理器支持，见 design.md 已知局限），缓存只覆盖列表列举
     """
@@ -48,10 +153,67 @@ async def get_tools_cached() -> list[BaseTool]:
     async with _tools_lock:
         if _fresh():
             return _tools_cache
+
+        from app.core import redisc
+
+        r = redisc.get_redis() if ttl > 0 else None
+        if r is not None:
+            tools = _try_redis_payload()
+            if tools is not None:
+                _tools_cache, _tools_cached_at = tools, time.monotonic()
+                return tools
+            # 跨进程单飞：抢到锁才有资格 spawn，否则等持锁方的载荷
+            try:
+                got_lock = bool(r.set(_lock_redis_key(), _worker_id,
+                                      nx=True, ex=_LOCK_TTL_S))
+            except Exception:  # noqa: BLE001 — 锁操作失败直接回退 spawn，不空等
+                logger.warning("工具单飞锁获取失败，直接 spawn 拉取", exc_info=True)
+                got_lock = None
+            if got_lock:
+                try:
+                    tools = await _fetch_and_store_payload(ttl)
+                    if tools is not None:
+                        return tools
+                finally:
+                    redisc.try_op(lambda c: c.delete(_lock_redis_key()),
+                                  what="tools lock del")
+            elif got_lock is False:
+                tools = await _wait_redis_payload()
+                if tools is not None:
+                    _tools_cache, _tools_cached_at = tools, time.monotonic()
+                    return tools
+                # 超时（持锁方崩溃/迟迟未写）：兜底自行 spawn，不持锁
+            # got_lock is None（Redis 异常）→ 直接落到下方 spawn
+
         client = MultiServerMCPClient(mcp_client_config())
         _tools_cache = await client.get_tools()
         _tools_cached_at = time.monotonic()
+        if ttl > 0 and r is not None:
+            _store_payload(_tools_cache, ttl)
     return _tools_cache
+
+
+async def _fetch_and_store_payload(ttl: int) -> list[BaseTool] | None:
+    """持锁方：spawn 拉取 → 回写 L2 载荷。返回 None 表示拉取失败需回退。"""
+    global _tools_cache, _tools_cached_at
+    try:
+        client = MultiServerMCPClient(mcp_client_config())
+        tools = await client.get_tools()
+    except Exception:  # noqa: BLE001 — spawn 失败释放锁，让等待方兜底
+        logger.warning("MCP 工具拉取失败，释放单飞锁由兜底路径重试", exc_info=True)
+        return None
+    _tools_cache, _tools_cached_at = tools, time.monotonic()
+    _store_payload(tools, ttl)
+    return tools
+
+
+def _store_payload(tools: list, ttl: int) -> None:
+    payload = _dump_tools(tools)
+    if payload is None:
+        return  # 不可序列化（如测试桩）→ 只保留 L1
+    from app.core import redisc
+    redisc.try_op(lambda c: c.set(_payload_redis_key(), payload, ex=ttl),
+                  what="tools payload set")
 
 
 def reset_tools_cache() -> None:
@@ -122,6 +284,8 @@ def mcp_client_config() -> dict:
             "env": {
                 "PYTHONPATH": str(BACKEND_DIR),
                 "DATABASE_URL": _absolute_db_url(),
+                # MCP 子进程内的检索缓存也要走 Redis（env 会整体替换，必须显式透传）
+                "REDIS_URL": settings.redis_url,
             },
         }
     }

@@ -80,6 +80,15 @@ class Settings(BaseSettings):
 
     # MCP 工具列表缓存 TTL（秒）：spawn+列举实测 ~1.5s/请求，缓存后降为一次性成本；0 = 关闭
     mcp_tools_cache_ttl: int = 300
+    # 工具列表分布式单飞锁等待上限（秒）：未抢到 Redis 锁时轮询等待持锁方写载荷的最长时间
+    mcp_tools_lock_wait_s: float = 4.0
+
+    # Redis（可选）：留空 = 完全不启用，全部能力走进程内缺省路径（单 worker 行为不变）。
+    # 配置后启用：限流 Lua 令牌桶 / 熔断状态共享 / 审批与取消 Pub/Sub / 工具缓存 L2 / 检索缓存
+    redis_url: str = Field(default="", validation_alias=AliasChoices("REDIS_URL"))
+
+    # 检索结果缓存 TTL（秒）：混合召回+重排全链路结果按 (用户, 查询, 语料指纹) 缓存；0 = 关闭
+    rag_cache_ttl_s: int = 600
 
     # 限流（每分钟）：聊天按用户、登录按客户端 IP；0 = 关闭（测试/评测脚本）
     rate_limit_chat_per_min: int = 10

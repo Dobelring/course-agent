@@ -10,15 +10,18 @@
 bad case），BM25 恰好补上精确词汇匹配；两路互补，RRF 免调权重。
 中文分词不引 jieba，用「中文二元组 + 英文单词」零依赖切分。
 """
+import hashlib
 import json
 import logging
 import math
 import re
 
 import numpy as np
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core import redisc
 from app.models.document import CourseDocument, DocumentChunk
 from app.rag.embedder import embed_query
 from app.rag.vecfmt import decode_json_vec, decode_vec
@@ -136,7 +139,52 @@ def _vector_scores(qv: list[float], candidates: list[dict]) -> list[float]:
 
 
 def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict]:
-    """检索当前用户已 ready 的文档切片：混合召回 → RRF → 重排 → top-k。"""
+    """检索当前用户已 ready 的文档切片：混合召回 → RRF → 重排 → top-k。
+
+    Redis 启用且 rag_cache_ttl_s>0 时整链路结果按 (用户, 查询, 语料指纹) 缓存
+    ——学生场景查询高度重复（同课程/同资料反复问），命中即跳过 embed+BM25+
+    重排全链路。语料指纹 = 用户 ready 切片的 (count, max_id)：新增/删除文档
+    自动失效，无需手动失效钩子；设置项（混合/重排/召回参数）拼进 key 防止
+    不同配置串用。未启用 Redis → 直接走原链路，行为不变。
+    """
+    if redisc.get_redis() is None or settings.rag_cache_ttl_s <= 0:
+        return _retrieve_uncached(db, user_id, query, top_k)
+    key = _cache_key(db, user_id, query, top_k)
+    raw = redisc.try_op(lambda c: c.get(key), default=None, what="rag cache get")
+    if raw is not None:
+        try:
+            cached = json.loads(raw)
+            logger.info("检索缓存命中 user=%s query=%r top_k=%d", user_id, query[:40], top_k)
+            return cached
+        except (ValueError, TypeError):
+            pass  # 载荷脏 → 当 miss 重算并覆盖
+    result = _retrieve_uncached(db, user_id, query, top_k)
+    redisc.try_op(
+        lambda c: c.set(key, json.dumps(result, ensure_ascii=False), ex=settings.rag_cache_ttl_s),
+        what="rag cache set",
+    )
+    return result
+
+
+def _cache_key(db: Session, user_id: int, query: str, top_k: int) -> str:
+    """缓存键：用户 + 归一化查询 + 检索配置 + 语料指纹。"""
+    count, max_id = (
+        db.query(func.count(DocumentChunk.id), func.max(DocumentChunk.id))
+        .join(CourseDocument, DocumentChunk.document_id == CourseDocument.id)
+        .filter(CourseDocument.user_id == user_id, CourseDocument.status == "ready")
+        .one()
+    )
+    fingerprint = "|".join(str(x) for x in (
+        user_id, " ".join(query.split()).lower(), top_k,
+        settings.rag_hybrid, settings.rag_rerank, settings.rag_recall_k,
+        settings.rag_rerank_top, settings.rag_max_per_doc,
+        count, max_id,
+    ))
+    return redisc.key("rag", hashlib.sha256(fingerprint.encode("utf-8")).hexdigest())
+
+
+def _retrieve_uncached(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict]:
+    """检索主链路（无缓存）。"""
     candidates = _load_candidates(db, user_id)
     if not candidates:
         return []

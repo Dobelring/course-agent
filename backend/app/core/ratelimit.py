@@ -1,4 +1,4 @@
-"""每用户/IP 令牌桶限流（进程内实现）。
+"""每用户/IP 令牌桶限流（进程内 + Redis 双后端）。
 
 设计取舍（面试可讲）：
 - 令牌桶 vs 固定/滑动窗口：桶允许小突发、长期速率受控；实现只需一个浮点计数，
@@ -6,8 +6,12 @@
 - 限在依赖层而非全局中间件：用户身份由 JWT 依赖解析，中间件层拿不到 user_id
   （除非再解析一次 token）；按路由声明式挂载——聊天（贵、按用户）与登录
   （防爆破、按 IP）各自配额，互不影响。
-- 进程内 dict 存桶：与 ACTIVE_RUNS / PENDING 同一单进程前提（见 README 局限），
-  多 worker 部署时换 Redis INCR+EXPIRE 或 Lua 令牌桶。
+- 双后端：配置 REDIS_URL 时走 Redis Lua 令牌桶——补币与扣币在一段脚本内原子
+  完成，多 worker 共享同一份配额（进程内 dict 每 worker 各一份，配额会被
+  放大 N 倍）；未配置/Redis 异常时退回进程内 dict（单 worker 行为不变，
+  Redis 挂掉宁可降配额精度也不误杀请求）。
+- Lua 里的时间用 time.time()（墙钟）而非 monotonic：多 worker 必须共享同一
+  时间基准，NTP 对齐的墙钟是唯一可选项（单机多 worker 天然同源）。
 - 配额为 0 表示关闭（测试与评测脚本用）。
 """
 from __future__ import annotations
@@ -15,8 +19,10 @@ from __future__ import annotations
 import time
 
 from fastapi import Depends, HTTPException, Request
+from loguru import logger
 
 from app.config import settings
+from app.core import redisc
 from app.core.security import get_current_user
 from app.models.user import User
 
@@ -47,7 +53,57 @@ class TokenBucket:
         return max(1, int((1.0 - self.tokens) / self.rate) + 1)
 
 
+# Redis 令牌桶：HMGET 读 (tokens, updated) → 按时间差补币 → 扣币 → 回写，
+# 全程单脚本原子执行（并发下不存在读改写竞争）；key 过期 = 桶闲置自动清理。
+_TOKEN_BUCKET_LUA = """
+local k = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local data = redis.call('HMGET', k, 'tokens', 'updated')
+local tokens = tonumber(data[1])
+local updated = tonumber(data[2])
+if tokens == nil or updated == nil then
+  tokens = capacity
+  updated = now
+end
+tokens = math.min(capacity, tokens + (now - updated) * rate)
+local allowed = 0
+local retry = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+else
+  retry = math.ceil((1 - tokens) / rate)
+  if retry < 1 then retry = 1 end
+end
+redis.call('HSET', k, 'tokens', tokens, 'updated', now)
+redis.call('EXPIRE', k, math.ceil(capacity / rate) + 60)
+return {allowed, retry}
+"""
+
+
 def _take(key: str, per_min: int) -> None:
+    """消耗一个令牌；配额不足抛 429（带 Retry-After）。"""
+    r = redisc.get_redis()
+    if r is not None:
+        try:
+            allowed, retry = r.eval(
+                _TOKEN_BUCKET_LUA, 1, redisc.key("rl", key),
+                float(per_min), per_min / 60.0, time.time(),
+            )
+            if int(allowed):
+                return
+            raise HTTPException(
+                status_code=429,
+                detail="请求过于频繁，请稍后再试",
+                headers={"Retry-After": str(max(1, int(retry)))},
+            )
+        except HTTPException:
+            raise
+        except Exception:  # noqa: BLE001 — Redis 异常降级本地桶
+            logger.warning("限流 Redis 操作失败，降级为本地桶", exc_info=True)
+    # 本地桶（单 worker 缺省路径 / Redis 降级路径）
     bucket = _BUCKETS.get(key)
     if bucket is None:
         bucket = _BUCKETS[key] = TokenBucket(per_min)

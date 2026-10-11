@@ -15,10 +15,24 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen-plus}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       SEMESTER_START: ${SEMESTER_START:-2026-09-07}
+      # Redis 可选：配 REDIS_URL 即启用限流共享/熔断共享/审批取消跨进程/两级缓存
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - uploads:/app/data/uploads   # 上传的课程资料持久化
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+
+  # 多 worker 跨进程状态（限流/熔断/审批取消信号/缓存）；不用 Redis 时
+  # 把 backend 的 REDIS_URL 置空即可（全部能力自动退回进程内缺省路径）
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
 
   frontend:
     build: ./frontend
@@ -29,3 +43,4 @@ services:
 
 volumes:
   uploads:
+  redis-data:

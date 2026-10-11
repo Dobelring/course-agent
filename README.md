@@ -147,7 +147,7 @@ Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · L
 
 ## 测试
 
-后端内置 **247 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**、**会话重命名/计数/空白清理**、**模型路由/限流/幂等/反思/断点续跑**与 API 集成，全部离线可跑（无需 API Key）：
+后端内置 **269 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**、**会话重命名/计数/空白清理**、**模型路由/限流/幂等/反思/断点续跑**、**Redis 后端（fakeredis：Lua 令牌桶/熔断共享/审批取消跨进程/两级工具缓存/检索缓存）**与 API 集成，全部离线可跑（无需 API Key，无需本机 Redis）：
 
 ```bash
 cd backend
@@ -180,6 +180,7 @@ python -m pytest tests/test_planner.py -v # 单文件
 | `test_interrupt_dedup.py` | **工具去重**（同请求同工具只上屏一次）、**前序结果注入指令**（防重复查询+防重复保存）、**取消语义**（注册表/归属校验/CancelledError 收尾） |
 | `test_chat_modes.py` | 模式路由 SSE 事件序列、plan 元数据落库、规划失败降级 direct、摘要持久化 |
 | `test_api.py` | 登录注册、课表/计划/会话跨用户 404、学生访问管理接口 403、`/chat` 无 Key 时 SSE 优雅报错、**会话重命名（越权 404/空标题 422）**、**计数只数 assistant**、**失败请求不留空白会话** |
+| `test_redis_backends.py` | **Redis 后端**（fakeredis 注入，共享 FakeServer 模拟单实例）：Lua 令牌桶共享配额/Retry-After/降级本地桶、熔断跨实例共享与半开重开、**审批与取消 Pub/Sub 跨 worker**（归属键寻址+越权 fail-closed）、**MCP 工具 L2 载荷重建免 spawn/单飞锁等待/超时兜底/不可序列化跳过**、检索缓存命中/归一化/语料指纹失效/TTL=0 关闭、健康检查 redis 状态 |
 
 每个用例使用独立 SQLite 测试库并在前后重建表，用例之间完全隔离。
 
@@ -187,6 +188,8 @@ python -m pytest tests/test_planner.py -v # 单文件
 - **审批 + 并发**（e2e_approval）：plan 模式 4 步任务，LLM 自主给出依赖 `[{},{},{},{1,2,3}]`（三路扇出 + 汇聚），`step_end` 顺序 `#1→#3→#2` 证明并发交织，`save_study_plan` 触发 `approval_required` → 决策 200 → 全链路 `4/4 done, 0 failed`
 - **去重 + 中断**（e2e_fixes）：同一任务 `tool_start` 仅 3~4 个（修复前 13 条含大量重复）；`run_id` + `POST cancel` → 流以 `cancelled` 收尾、重复取消 404、已生成部分落库标记「已手动停止」
 - **流式 + 会话 + 三态审批 + 断点续跑**（e2e_stream_rename）：plan 综合逐段流式（单次回答 589 个 text 增量 + 274 个 step_text 增量，修复前整段 1 个）；侧栏计数 = assistant 条数；重命名 200 / 越权 404 / 空标题 422；**revise→模型调整→二次审批→批准** 全链路；**中途取消 → plan_run_id → 续跑只补未完成步骤 → 正常收尾**
+
+**离线跨进程 E2E**（`scripts/e2e_redis_crossproc.py`，无需 Key，需 `docker compose up -d redis` + `REDIS_URL`）：两个真实 OS 进程共享同一 Redis，10 项断言四路验证多 worker 跨进程语义——**取消**（归属键寻址→Pub/Sub→worker 侧 Task 被 cancel、越权 404）、**审批**（同链路→Future 被解开、越权拒绝）、**限流**（3/min 配额跨进程共享：worker 用 2、coordinator 第 3 次放行、第 4 次 429 带 Retry-After）、**熔断**（worker 上报 2 次失败→coordinator 新建 router 读到 open）；worker 侧本地注册表为空，全程 LLM 零调用。
 
 ## 评测（Evaluation）
 
@@ -252,9 +255,9 @@ python scripts/eval.py all         # 全部
 
 | 局限 | 现状 | 改进方案 |
 |---|---|---|
-| **审批/取消注册表是单进程内存**（`approval.py` 的 `PENDING`、`chat.py` 的 `ACTIVE_RUNS`） | 依赖 asyncio 单线程 + 单 worker 部署，跨进程无法传递 Future/任务句柄 | 多 worker 部署时换 Redis Pub/Sub 或数据库轮询解锁；横向扩容前必须处理 |
+| **多 worker 跨进程状态需配置 Redis**（`PENDING`、`ACTIVE_RUNS`、熔断计数、令牌桶、工具缓存、检索缓存） | **Redis 后端已实现并完成真实跨进程联调**（`REDIS_URL` 启用，留空 = 原进程内路径逐字节不变）：审批/取消 = 归属键寻址 + Pub/Sub 信号回持有 worker；限流 = Lua 令牌桶原子补扣币（多 worker 共享配额）；熔断 = 跨实例共享状态（半开探测一致）；MCP 工具 = L2 schema 载荷 + SET NX 分布式单飞；检索 = 语料指纹结果缓存；任一 Redis 异常按能力降级（限流回本地桶/信号回 404/缓存回 miss）。269 测试含 17 例 fakeredis；**双进程联调 `scripts/e2e_redis_crossproc.py` 10/10 通过**（真 Redis：取消/审批/限流/熔断四路），HTTP 冒烟 429+Retry-After 实测 | 部署多 worker 时配 `REDIS_URL`（docker-compose 已附 redis 服务）；残余：跨机部署需 NTP 对齐墙钟（限流/熔断用 `time.time()`）、Redis 失效时该 worker 短暂退回进程内状态 |
 | **单步查询分类偏保守** | 扩容后分层暴露：单步查询分类 75%（p05/p21 误判复杂），其余意图 100% | 分类提示词给单工具判据加正例；或单工具意图走规则前置 |
 | **完成率评测依赖演示数据** | 断言基于 seed 数据的字段（GPA、课程名），换数据集需同步改断言 | 断言改为读数据库期望值而非硬编码 |
 | **MCP 每请求拉起子进程** | 每次聊天 spawn 一次 stdio 子进程，冷启动有开销 | 常驻连接池或改用 streamable HTTP transport |
 | **无 Alembic 迁移** | 列变更靠 `_ensure_columns` 手写 ALTER，表结构变更能力弱 | 正式项目引入 Alembic，出 revision 脚本 |
-| **前端无测试** | 149 个测试全在后端 | 补 Vitest 覆盖 SSE 事件状态机与审批弹窗 |
+| **前端无测试** | 269 个测试全在后端 | 补 Vitest 覆盖 SSE 事件状态机与审批弹窗 |

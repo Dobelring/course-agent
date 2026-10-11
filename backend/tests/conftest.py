@@ -14,6 +14,10 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
 # 不清空会让路由绕过空 Key 检查，真实调用泄漏进测试环境
 os.environ["LLM_API_KEY"] = ""
 os.environ["LLM_ROUTES"] = ""
+# Redis 必须清空：与 LLM_ROUTES 同理，用户 .env 可能配了真实 REDIS_URL，
+# 不清空会让测试连真实 Redis（污染数据/依赖本机服务）。Redis 后端路径由
+# test_redis_backends 用 fakeredis 注入覆盖
+os.environ["REDIS_URL"] = ""
 # 单测关闭交叉编码器重排（避免下载模型）；混合召回保持开启以覆盖 RRF 逻辑
 os.environ["RAG_RERANK"] = "false"
 # 单测关闭模型预热（避免测试启动时加载/下载模型）

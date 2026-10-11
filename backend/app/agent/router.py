@@ -23,8 +23,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from loguru import logger
 
 from app.config import settings
+from app.core import redisc
 
 
 @dataclass
@@ -102,8 +104,25 @@ class ModelRouter:
 
     # ---- 选路 ----
 
+    def _brk_key(self, name: str) -> str:
+        return redisc.key("brk", name)
+
+    def _allow(self, name: str) -> bool:
+        """该路由当前是否放行；Redis 可用时读共享熔断状态（多 worker 一致）。"""
+        r = redisc.get_redis()
+        if r is not None:
+            try:
+                opened = r.hget(self._brk_key(name), "opened_at")
+                if not opened:
+                    return True
+                # 墙钟（共享时间基准）：冷却结束 → half-open 放行一个探测
+                return time.time() - float(opened) >= self.cooldown_s
+            except Exception:  # noqa: BLE001 — Redis 异常退回本地熔断
+                logger.warning("熔断状态读取失败，降级本地计数", exc_info=True)
+        return self.breakers[name].allow()
+
     def _available(self) -> list[RouteConfig]:
-        return [r for r in self.routes if self.breakers[r.name].allow()]
+        return [r for r in self.routes if self._allow(r.name)]
 
     def pick(self, usage: Any = None) -> tuple[RouteConfig, ChatOpenAI]:
         """选最优可用路由并构建 LLM 实例；全部熔断时抛 ValueError。"""
@@ -131,27 +150,73 @@ class ModelRouter:
     # ---- 熔断上报 ----
 
     def report_success(self, name: str) -> None:
-        if name in self.breakers:
-            self.breakers[name].record_success()
+        if name not in self.breakers:
+            return
+        r = redisc.get_redis()
+        if r is not None:
+            try:
+                k = self._brk_key(name)
+                r.hset(k, mapping={"failures": 0})
+                r.hdel(k, "opened_at")
+                return
+            except Exception:  # noqa: BLE001 — Redis 异常退回本地熔断
+                logger.warning("熔断状态写入失败，降级本地计数", exc_info=True)
+        self.breakers[name].record_success()
 
     def report_failure(self, name: str) -> None:
-        if name in self.breakers:
-            self.breakers[name].record_failure()
+        if name not in self.breakers:
+            return
+        r = redisc.get_redis()
+        if r is not None:
+            try:
+                k = self._brk_key(name)
+                opened = r.hget(k, "opened_at")
+                if opened:
+                    # half-open 探测仍失败 → 重新计时熔断（与本地语义一致）
+                    r.hset(k, "opened_at", time.time())
+                    return
+                failures = int(r.hincrby(k, "failures", 1))
+                if failures >= self.threshold:
+                    r.hset(k, "opened_at", time.time())
+                return
+            except Exception:  # noqa: BLE001 — Redis 异常退回本地熔断
+                logger.warning("熔断状态写入失败，降级本地计数", exc_info=True)
+        self.breakers[name].record_failure()
 
     def snapshot(self) -> list[dict]:
-        """当前路由与熔断状态（观测/调试用）。"""
+        """当前路由与熔断状态（观测/调试用）：Redis 可用时读共享状态。"""
+        r = redisc.get_redis()
         out = []
-        for r in self.routes:
-            b = self.breakers[r.name]
+        for route in self.routes:
+            if r is not None:
+                try:
+                    h = r.hgetall(self._brk_key(route.name))
+                    opened = h.get("opened_at")
+                    if not opened:
+                        state = "closed"
+                    elif time.time() - float(opened) >= self.cooldown_s:
+                        state = "half-open"
+                    else:
+                        state = "open"
+                    out.append(self._snap(route, state, int(h.get("failures", 0) or 0)))
+                    continue
+                except Exception:  # noqa: BLE001 — 失败回退整段本地快照
+                    logger.warning("熔断快照读取失败，降级本地状态", exc_info=True)
+                    r = None
+            b = self.breakers[route.name]
             if b.opened_at is None:
                 state = "closed"
             elif b.allow():
                 state = "half-open"
             else:
                 state = "open"
-            out.append({"name": r.name, "model": r.model, "priority": r.priority,
-                        "weight": r.weight, "state": state, "failures": b.failures})
+            out.append(self._snap(route, state, b.failures))
         return out
+
+    @staticmethod
+    def _snap(route: RouteConfig, state: str, failures: int) -> dict:
+        return {"name": route.name, "model": route.model, "priority": route.priority,
+                "weight": route.weight, "state": state, "failures": failures}
 
 
 # ---- 构建与单例 ----

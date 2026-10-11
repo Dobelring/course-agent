@@ -49,6 +49,7 @@ from app.agent.plan_executor import ExecutionResult, execute_plan
 from app.agent.resilience import retry_async
 from app.agent.usage import UsageCollector
 from app.config import settings
+from app.core import redisbus, redisc
 from app.core.ratelimit import limit_chat
 from app.core.security import get_current_user
 from app.database import SessionLocal
@@ -75,16 +76,42 @@ class CancelRequest(BaseModel):
 
 
 # 活跃任务注册表：run_id → (owner_user_id, task)。
-# 与审批注册表同局限：单进程内存，多 worker 需换 Redis（见 README 已知局限）。
+# Task 句柄无法跨进程——Redis 启用时归属键 run:{id}（TTL=2h）声明「该 run 在
+# 哪个 worker」，取消请求落在别的 worker 时经 Pub/Sub 广播回持有方；
+# 未启用 Redis 时保持单进程语义（见 README 已知局限）。
 ACTIVE_RUNS: dict[str, tuple[int, asyncio.Task]] = {}
+
+RUN_KEY_TTL_S = 7200  # 单次 run 的归属键有效期（覆盖最长计划执行 + 泄漏兜底）
+
+
+def _run_key(run_id: str) -> str:
+    return redisc.key("run", run_id)
 
 
 def _register_run(run_id: str, user_id: int, task: asyncio.Task) -> None:
     ACTIVE_RUNS[run_id] = (user_id, task)
+    redisc.try_op(lambda c: c.set(_run_key(run_id), user_id, ex=RUN_KEY_TTL_S),
+                  what="run key set")
 
 
 def _unregister_run(run_id: str) -> None:
     ACTIVE_RUNS.pop(run_id, None)
+    redisc.try_op(lambda c: c.delete(_run_key(run_id)), what="run key del")
+
+
+def _on_cancel_signal(data: dict) -> None:
+    """Pub/Sub 落地：别的 worker 收到的取消信号在本进程（持有 Task）执行。"""
+    entry = ACTIVE_RUNS.get(str(data.get("run_id", "")))
+    if entry is None:
+        return
+    owner_id, task = entry
+    if owner_id != data.get("user_id"):  # 落地端复核归属，防越权广播
+        return
+    if not task.done():
+        task.cancel()
+
+
+redisbus.set_handler(redisbus.PUBSUB_CANCEL, _on_cancel_signal)
 
 
 class ApprovalDecision(BaseModel):
@@ -176,10 +203,23 @@ async def cancel_run(
     """中途取消：停掉该 run_id 的后台任务，SSE 流随即收到 cancelled 事件。
 
     归属校验：只能取消自己的任务；未注册（已结束/不存在）返回 404。
+    本进程持有 Task → 直接 cancel（单 worker 快路径）；不在本进程 →
+    查 Redis 归属键：存在且属于当前用户则广播 Pub/Sub 给持有 worker，
+    不存在/Redis 未启用 → 404（与单进程一致，fail-closed）。
     """
     entry = ACTIVE_RUNS.get(payload.run_id)
     if entry is None:
-        raise HTTPException(status_code=404, detail="任务不存在或已结束")
+        owner = redisc.try_op(
+            lambda c: c.get(_run_key(payload.run_id)),
+            default=None,
+            what="run key get",
+        )
+        if owner is None or int(owner) != current_user.id:
+            raise HTTPException(status_code=404, detail="任务不存在或已结束")
+        if not redisbus.publish_cancel(payload.run_id, current_user.id):
+            # 归属键在但信号发不出：Redis 在两次调用之间失效，按不存在处理
+            raise HTTPException(status_code=404, detail="任务不存在或已结束")
+        return {"ok": True}
     owner_id, task = entry
     if owner_id != current_user.id:
         raise HTTPException(status_code=404, detail="任务不存在或已结束")
