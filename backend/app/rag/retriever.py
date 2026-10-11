@@ -15,11 +15,13 @@ import logging
 import math
 import re
 
+import numpy as np
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.document import CourseDocument, DocumentChunk
 from app.rag.embedder import embed_query
+from app.rag.vecfmt import decode_json_vec, decode_vec
 
 logger = logging.getLogger(__name__)
 
@@ -92,25 +94,21 @@ def rrf_fuse(rankings: list[list[int]], k: int = RRF_K) -> dict[int, float]:
     return fused
 
 
-def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict]:
-    """检索当前用户已 ready 的文档切片：混合召回 → RRF → 重排 → top-k。"""
+def _load_candidates(db: Session, user_id: int) -> list[dict]:
+    """加载当前用户 ready 文档的切片候选：BLOB 优先、旧 JSON 只读兼容。"""
     rows = (
         db.query(DocumentChunk, CourseDocument.filename)
         .join(CourseDocument, DocumentChunk.document_id == CourseDocument.id)
         .filter(CourseDocument.user_id == user_id, CourseDocument.status == "ready")
         .all()
     )
-
-    # ---- 候选集：仅保留有向量的切片（重排也需要向量侧候选一致） ----
     candidates: list[dict] = []
     for chunk, filename in rows:
-        try:
-            vec = json.loads(chunk.embedding or "[]")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            # 脏数据跳过，不让一条坏切片拖垮整个检索
-            logger.warning("切片向量解析失败，已跳过 chunk_id=%s", chunk.id)
-            continue
-        if not vec:
+        vec = decode_vec(chunk.embedding_blob) or decode_json_vec(chunk.embedding)
+        if vec is None:
+            # 脏数据（空/坏 BLOB 与坏 JSON）跳过，不让一条坏切片拖垮整个检索
+            if chunk.embedding_blob or chunk.embedding:
+                logger.warning("切片向量解析失败，已跳过 chunk_id=%s", chunk.id)
             continue
         candidates.append({
             "chunk_id": chunk.id,
@@ -119,13 +117,39 @@ def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict
             "content": chunk.content,
             "vec": vec,
         })
+    return candidates
+
+
+def _vector_scores(qv: list[float], candidates: list[dict]) -> list[float]:
+    """批量余弦：numpy 矩阵点积替代 Python 逐元素循环。
+
+    BGE 向量本身已 L2 归一化，余弦退化为点积；为防御未归一化数据，
+    显式按模长归一化后再点积（纯零向量按 1 处理，得分 0）。
+    """
+    mat = np.asarray([c["vec"] for c in candidates], dtype=np.float32)
+    q = np.asarray(qv, dtype=np.float32)
+    mat_norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    mat_norms[mat_norms == 0.0] = 1.0
+    q_norm = float(np.linalg.norm(q)) or 1.0
+    sims = (mat / mat_norms) @ (q / q_norm)
+    return [float(s) for s in sims]
+
+
+def retrieve(db: Session, user_id: int, query: str, top_k: int = 3) -> list[dict]:
+    """检索当前用户已 ready 的文档切片：混合召回 → RRF → 重排 → top-k。"""
+    candidates = _load_candidates(db, user_id)
     if not candidates:
         return []
 
     # ---- 第一路：向量召回 ----
     qv = embed_query(query)
-    for c in candidates:
-        c["cos"] = cosine(qv, c["vec"])
+    # 维度不齐（历史模型更换残留）的候选不进矩阵，避免形状错误
+    candidates = [c for c in candidates if len(c["vec"]) == len(qv)]
+    if not candidates:
+        return []
+    sims = _vector_scores(qv, candidates)
+    for c, s in zip(candidates, sims):
+        c["cos"] = s
     vec_ranked = sorted(candidates, key=lambda c: c["cos"], reverse=True)
 
     if not settings.rag_hybrid:

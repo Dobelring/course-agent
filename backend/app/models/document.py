@@ -29,4 +29,6 @@ class DocumentChunk(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("course_documents.id"), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[str | None] = mapped_column(Text)  # JSON 字符串或向量库引用
+    embedding: Mapped[str | None] = mapped_column(Text)  # 旧格式：JSON 字符串（只读兼容）
+    # 新格式：float32 BLOB（numpy tobytes）——体积约为 JSON 的 1/3，解析零开销
+    embedding_blob: Mapped[bytes | None] = mapped_column(nullable=True)

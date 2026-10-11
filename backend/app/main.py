@@ -41,6 +41,8 @@ def _ensure_columns() -> None:
          "ALTER TABLE ai_messages ADD COLUMN cost_cny DOUBLE"),
         ("study_plans", "fingerprint",
          "ALTER TABLE study_plans ADD COLUMN fingerprint VARCHAR(64)"),
+        ("document_chunks", "embedding_blob",
+         "ALTER TABLE document_chunks ADD COLUMN embedding_blob BLOB"),
     ]
     for table, column, ddl in migrations:
         try:
