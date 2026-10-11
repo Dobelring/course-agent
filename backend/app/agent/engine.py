@@ -179,11 +179,70 @@ def build_agent(user: User, tools: list[BaseTool], extra_system: str = "", llm: 
     prompt = build_system_prompt(user)
     if extra_system:
         prompt += f"\n\n{extra_system}"
+    # 模型循环调用护栏（扩容评测 t14 暴露：模糊查询反复调全部工具直到
+    # GraphRecursionError）——每个请求共享一本调用台账
     return create_agent(
         llm if llm is not None else build_llm(),
-        tools,
+        _guard_tools(tools),
         system_prompt=prompt,
     )
+
+
+def _guard_tools(tools: list[BaseTool]) -> list[BaseTool]:
+    """给全部工具包上循环调用护栏（同一请求共享一本台账）。"""
+    ledger: dict = {}
+    return [
+        LoopGuardTool(
+            underlying=t, ledger=ledger,
+            name=t.name, description=t.description, args_schema=t.args_schema,
+        )
+        for t in tools
+    ]
+
+
+class LoopGuardTool(BaseTool):
+    """模型循环调用护栏：同参重复调用与总调用次数超限即拦截。
+
+    拦截时**不执行**底层工具，返回提示文本让模型停止循环、基于已有结果作答
+    ——比硬吃 GraphRecursionError（整轮报错）体验好得多，也是评测里
+    t14 失效模式的机制级修复。每个请求一本台账（build_agent 内创建），
+    并行步骤共享计数（循环调用在任一步骤都该被拦截）。
+    """
+
+    underlying: BaseTool
+    # Any 注解避免 pydantic 对 dict 深拷贝——同一请求的全部工具必须共享同一实例
+    ledger: Any  # (tool, args指纹) -> 次数；特殊键 "__total__" 累计总调用
+    max_identical: int = 2   # 同参第 N+1 次拦截
+    max_total: int = 12      # 单次请求工具调用总数上限
+
+    def _run(self, **kwargs) -> object:
+        raise RuntimeError("LoopGuardTool 依赖异步运行时（_arun），同步路径不应被调用")
+
+    async def _arun(self, **kwargs) -> object:
+        import hashlib
+        import json as _json
+
+        fingerprint = _json.dumps(
+            [self.underlying.name, kwargs],
+            ensure_ascii=False, sort_keys=True, default=str,
+        )
+        key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+        self.ledger[key] = self.ledger.get(key, 0) + 1
+        self.ledger["__total__"] = self.ledger.get("__total__", 0) + 1
+
+        if self.ledger[key] > self.max_identical:
+            return (
+                f"【重复调用拦截】你已用相同参数调用过「{self.underlying.name}」"
+                f"{self.ledger[key] - 1} 次，再次调用结果不会变化。"
+                "请不要再调用任何工具，直接基于已有结果回答用户。"
+            )
+        if self.ledger["__total__"] > self.max_total:
+            return (
+                f"【调用次数超限】本请求已连续调用工具 {self.ledger['__total__'] - 1} 次。"
+                "请立即停止调用工具，基于已获得的信息直接回答用户；"
+                "如信息不足，如实说明哪些部分无法确认。"
+            )
+        return await self.underlying.ainvoke(kwargs)
 
 
 def pretty_tool_name(name: str) -> str:

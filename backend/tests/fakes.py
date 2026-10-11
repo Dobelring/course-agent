@@ -52,7 +52,7 @@ class FakeLLM:
 class FakeAgent:
     """伪造 create_agent 返回对象：产出一次工具调用 + 流式文本。"""
 
-    async def astream_events(self, inputs, version=None):
+    async def astream_events(self, inputs, config=None, version=None):
         yield {"event": "on_tool_start", "name": "get_my_schedule",
                "data": {"input": {"user_id": 1, "weekday": 1}}}
         yield {"event": "on_tool_end", "name": "get_my_schedule",

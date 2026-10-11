@@ -66,7 +66,7 @@ class RecordingAgent:
     def __init__(self):
         self.instructions = []
 
-    async def astream_events(self, inputs, version=None):
+    async def astream_events(self, inputs, config=None, version=None):
         self.instructions.append(inputs["messages"][-1].content)
         for ch in "步骤完成":
             yield {"event": "on_chat_model_stream",
@@ -83,7 +83,7 @@ class HangingAgent:
     def __init__(self):
         self.started = asyncio.Event()
 
-    async def astream_events(self, inputs, version=None):
+    async def astream_events(self, inputs, config=None, version=None):
         yield {"event": "on_chat_model_stream",
                "data": {"chunk": SimpleNamespace(content="部分产出")}}
         self.started.set()  # 已进入执行中（step_start 之后）

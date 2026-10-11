@@ -418,7 +418,11 @@ async def chat(payload: ChatRequest,
             async def run_direct() -> None:
                 try:
                     async for ev in forward_tool_events(
-                        agent.astream_events(agent_input, version="v2")
+                        agent.astream_events(
+                            agent_input,
+                            config={"recursion_limit": settings.agent_recursion_limit},
+                            version="v2",
+                        )
                     ):
                         if ev.get("_raw") is not None:
                             event = ev["_raw"]
@@ -481,7 +485,11 @@ async def chat(payload: ChatRequest,
                     step_input = {"messages": history_msgs + [HumanMessage(content=instruction)]}
                     try:
                         async for ev in forward_tool_events(
-                            step_agent.astream_events(step_input, version="v2"),
+                            step_agent.astream_events(
+                                step_input,
+                                config={"recursion_limit": settings.agent_recursion_limit},
+                                version="v2",
+                            ),
                             step_id=step.id,
                         ):
                             if ev.get("_raw") is not None:

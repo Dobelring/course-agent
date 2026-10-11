@@ -713,7 +713,13 @@ def main() -> int:
         if which in ("retrieval", "all"):
             results["retrieval"] = run_retrieval_eval(db, user)
         if which in ("tools", "all"):
-            results["tool"] = asyncio.run(run_tool_eval())
+            rounds = [asyncio.run(run_tool_eval()) for _ in range(repeat)]
+            tool_m = dict(rounds[-1])
+            tool_m.update({"repeat": repeat,
+                           "mean_std": _aggregate_rounds(rounds, ["tool_accuracy"])})
+            results["tool"] = tool_m
+            if repeat > 1:
+                print(f"\n[tool 方差] {repeat} 轮：{tool_m['mean_std']}")
         if which in ("plan", "all"):
             rounds = [asyncio.run(run_plan_eval()) for _ in range(repeat)]
             plan_m = dict(rounds[-1])

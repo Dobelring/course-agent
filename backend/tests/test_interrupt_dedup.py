@@ -96,7 +96,7 @@ def test_cancelled_task_completes_as_cancelled():
 class RepeatingToolAgent(FakeAgent):
     """每个步骤都调 get_my_schedule（模拟模型重复查询）。"""
 
-    async def astream_events(self, inputs, version=None):
+    async def astream_events(self, inputs, config=None, version=None):
         yield {"event": "on_tool_start", "name": "get_my_schedule",
                "data": {"input": {"user_id": 1, "weekday": 1}}}
         yield {"event": "on_tool_end", "name": "get_my_schedule",
@@ -146,7 +146,7 @@ class RecordingAgent(FakeAgent):
     def __init__(self):
         self.instructions: list[str] = []
 
-    async def astream_events(self, inputs, version=None):
+    async def astream_events(self, inputs, config=None, version=None):
         self.instructions.append(inputs["messages"][-1].content)
         for ch in "产出结果ABC":
             yield {"event": "on_chat_model_stream",

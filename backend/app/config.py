@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     # 三态审批：单步最多「修改后执行」轮数（用户给修改意见 → 模型调整后重新发起审批）
     agent_approval_max_revises: int = 2
 
+    # 模型循环调用护栏（评测 t14 失效模式的机制级修复）：
+    # 同参调用超过 max_identical 次拦截、单请求工具调用总数超 cap 拦截
+    agent_max_identical_calls: int = 2
+    agent_tool_call_cap: int = 12
+    # LangGraph 递归上限（模型-工具循环步数天花板，25 为框架默认）
+    agent_recursion_limit: int = 25
+
     # 反思环节：综合产出后自检质量（1-5 分），低于阈值且给出修订则替换答案
     agent_reflect: bool = True
     agent_reflect_min_quality: int = 3
