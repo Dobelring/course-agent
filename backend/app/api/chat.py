@@ -39,7 +39,13 @@ from app.agent.context import ContextPlan, build_context, split_history
 from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_config, pretty_tool_name
 from app.agent.reflection import reflect
 from app.agent.router import get_router
-from app.agent.planner import Plan, PlanStep, classify_complexity, create_plan
+from app.agent.planner import (
+    Plan,
+    PlanStep,
+    classify_complexity,
+    create_plan,
+    plan_from_dicts,
+)
 from app.agent.plan_executor import ExecutionResult, execute_plan
 from app.agent.resilience import retry_async
 from app.agent.usage import UsageCollector
@@ -49,6 +55,7 @@ from app.core.security import get_current_user
 from app.database import SessionLocal
 from app.models.approval import ApprovalLog
 from app.models.conversation import AiConversation, AiMessage
+from app.models.plan import PlanRun
 from app.models.user import User
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -61,6 +68,7 @@ class ChatRequest(BaseModel):
     conversation_id: int | None = None
     mode: Literal["auto", "direct", "plan"] = "auto"
     run_id: str | None = None  # 客户端生成，用于中途取消
+    resume_plan_id: int | None = None  # 断点续跑：从暂停的 PlanRun 恢复执行
 
 
 class CancelRequest(BaseModel):
@@ -207,6 +215,9 @@ async def chat(payload: ChatRequest,
         db = SessionLocal()
         conversation = None
         created_here = False  # 本请求新建的会话：失败收尾时若无消息则清理，不留空白会话
+        # 规划对象暂存：run_step 读取已完成步骤结果（跨步骤上下文传递）、
+        # 续跑/取消/收尾读取执行状态。必须在 resume 分支之前定义
+        plan_holder: dict = {}
         collected_text: list[str] = []
         tool_records: list[dict] = []
         retrieval_sources = None
@@ -266,7 +277,22 @@ async def chat(payload: ChatRequest,
             # ---------- 模式路由 ----------
             mode = payload.mode
             classify_reason = ""
-            if mode == "auto":
+            resumed_plan: Plan | None = None
+            if payload.resume_plan_id:
+                # 断点续跑：加载持久化的计划状态，跳过规划，只补 pending 步骤
+                run_row = db.get(PlanRun, payload.resume_plan_id)
+                if run_row is None or run_row.user_id != current_user.id:
+                    yield _sse({"type": "error", "message": "要继续的计划不存在或无权访问"})
+                    return
+                state = json.loads(run_row.plan_json or "{}")
+                resumed_plan = plan_from_dicts(state.get("steps", []),
+                                              revised=state.get("revised", 0))
+                run_row.status = "running"
+                db.commit()
+                plan_holder["run_row_id"] = run_row.id  # 续跑同样接状态持久化
+                mode = "plan"
+                classify_reason = "续跑暂停的计划"
+            elif mode == "auto":
                 is_complex, classify_reason = await classify_complexity(llm, payload.message)
                 mode = "plan" if is_complex else "direct"
             yield _sse({"type": "mode", "mode": mode, "reason": classify_reason})
@@ -389,9 +415,6 @@ async def chat(payload: ChatRequest,
                     else:
                         yield {"_raw": event}  # 交由调用方处理文本流
 
-            # 规划对象暂存：run_step 读取已完成步骤结果（跨步骤上下文传递）
-            plan_holder: dict = {}
-
             # ---------- direct：单循环（事件入队，由生成器 drain） ----------
             async def run_direct() -> None:
                 try:
@@ -485,25 +508,66 @@ async def chat(payload: ChatRequest,
             degraded = False
             plan_meta: dict | None = None
 
+            def _persist_plan_state(status: str | None = None) -> None:
+                """把 plan_holder 中的计划状态落库（每完成一步即持久化）。
+
+                同步写、事件回调内低频执行；失败只记日志不阻断执行。
+                """
+                run_row_id = plan_holder.get("run_row_id")
+                plan: Plan | None = plan_holder.get("plan")
+                if not run_row_id or plan is None:
+                    return
+                try:
+                    row = db.get(PlanRun, run_row_id)
+                    if row is None:
+                        return
+                    row.plan_json = json.dumps(
+                        {"steps": [s.to_dict() for s in plan.steps],
+                         "revised": plan.revised},
+                        ensure_ascii=False,
+                    )
+                    if status is not None:
+                        row.status = status
+                    db.commit()
+                except Exception:  # noqa: BLE001 — 状态持久化失败不阻断执行
+                    logger.warning("计划状态落库失败", exc_info=True)
+                    db.rollback()
+
             async def run_plan() -> dict:
                 """规划执行主流程；规划失败/无产出时降级 direct（事件仍入同一队列）。"""
                 nonlocal mode_used, degraded, plan_meta
-                plan: Plan | None = None
-                try:
-                    steps = await retry_async(
-                        lambda: create_plan(
-                            llm, payload.message, pretty_names,
-                            ctx.summary_block, settings.agent_max_steps,
-                        ),
-                        retries=1, base_delay=0.5,
-                    )
-                    plan = Plan(steps=steps)
+                plan: Plan | None = resumed_plan
+                if plan is None:
+                    try:
+                        steps = await retry_async(
+                            lambda: create_plan(
+                                llm, payload.message, pretty_names,
+                                ctx.summary_block, settings.agent_max_steps,
+                            ),
+                            retries=1, base_delay=0.5,
+                        )
+                        plan = Plan(steps=steps)
+                    except Exception as exc:  # noqa: BLE001
+                        await sink({"type": "fallback", "to": "direct",
+                                    "reason": f"规划失败：{type(exc).__name__}: {exc}"})
+                        mode_used = "direct"
+                        degraded = True
+                if plan is not None:
                     plan_holder["plan"] = plan  # 供 run_step 读取前序步骤结果
-                except Exception as exc:  # noqa: BLE001
-                    await sink({"type": "fallback", "to": "direct",
-                                "reason": f"规划失败：{type(exc).__name__}: {exc}"})
-                    mode_used = "direct"
-                    degraded = True
+                    if resumed_plan is None:
+                        # 新计划登记持久化行（断点续跑 / 人工接管的基础）
+                        row = PlanRun(
+                            user_id=current_user.id, conversation_id=conversation.id,
+                            title=payload.message[:50],
+                            plan_json=json.dumps(
+                                {"steps": [s.to_dict() for s in plan.steps],
+                                 "revised": plan.revised}, ensure_ascii=False),
+                            status="running",
+                        )
+                        db.add(row)
+                        db.commit()
+                        db.refresh(row)
+                        plan_holder["run_row_id"] = row.id
 
                 executor: ExecutionResult | None = None
                 if plan is not None:
@@ -514,6 +578,10 @@ async def chat(payload: ChatRequest,
                         if evt.get("type") == "text":
                             text_seen = True
                         await sink(evt)
+                        # plan（初始/续跑展示）/ step_end（含 done/failed/skipped）/
+                        # replan（步骤替换）之后即时持久化——任何时点中断都可续跑
+                        if evt.get("type") in ("plan", "step_end", "replan"):
+                            _persist_plan_state()
 
                     executor = await execute_plan(
                         llm, payload.message, plan, run_step,
@@ -529,6 +597,10 @@ async def chat(payload: ChatRequest,
                         "done": executor.steps_done,
                         "failed": executor.steps_failed,
                     }
+                    # 执行结束：计划状态终态化（done/failed 均不再提供续跑入口）
+                    _persist_plan_state(
+                        "done" if (executor.success or executor.user_denied) else "failed"
+                    )
                     if executor.user_denied and not executor.answer:
                         # 用户主动拒绝：不降级（降级会再次触发审批），直接说明
                         await sink({"type": "text",
@@ -606,12 +678,31 @@ async def chat(payload: ChatRequest,
                 # 保留已生成的部分内容（用户可能需要），标记为已停止
                 if answer:
                     answer += "\n\n（已手动停止）"
+                # 计划执行到一半被停：plan 元数据带 paused 标记与续跑 id 落库，
+                # 前端在该条消息上展示「继续执行」入口（人工接管）
+                cancel_plan_meta = None
+                if plan_holder.get("run_row_id") and plan_holder.get("plan"):
+                    _persist_plan_state("paused")
+                    cancel_plan_meta = {
+                        "steps": [s.to_dict() for s in plan_holder["plan"].steps],
+                        "revised": plan_holder["plan"].revised,
+                        "degraded": False,
+                        "done": sum(1 for s in plan_holder["plan"].steps if s.status == "done"),
+                        "failed": sum(1 for s in plan_holder["plan"].steps
+                                      if s.status in ("failed", "skipped")),
+                        "paused": True,
+                        "plan_run_id": plan_holder["run_row_id"],
+                    }
                 db.add(AiMessage(conversation_id=conversation.id, role="user", content=payload.message))
                 db.add(
                     AiMessage(
                         conversation_id=conversation.id,
                         role="assistant",
                         content=answer,
+                        plan=(
+                            json.dumps(cancel_plan_meta, ensure_ascii=False)
+                            if cancel_plan_meta else None
+                        ),
                         latency_ms=latency,
                         first_token_ms=first_token_ms,
                         input_tokens=usage.input_tokens,
@@ -626,6 +717,7 @@ async def chat(payload: ChatRequest,
                         "conversation_id": conversation.id,
                         "latency_ms": latency,
                         "partial_chars": len(answer),
+                        "plan_run_id": plan_holder.get("run_row_id"),
                     }
                 )
                 return
@@ -687,6 +779,17 @@ async def chat(payload: ChatRequest,
             if task is not None and not task.done():
                 task.cancel()  # 客户端断开等中断场景：停止后台执行
             _unregister_run(run_id)
+            # 请求异常/断线收尾：仍在 running 的计划标记 paused，保留续跑入口
+            # （正常 done/failed/paused 均已终态化，此处只兜底 running 残留）
+            try:
+                leftover_id = plan_holder.get("run_row_id")
+                if leftover_id:
+                    row = db.get(PlanRun, leftover_id)
+                    if row is not None and row.status == "running":
+                        row.status = "paused"
+                        db.commit()
+            except Exception:  # noqa: BLE001 — 收尾失败不影响主流程
+                db.rollback()
             # 本请求新建且一条消息都没落库（失败/断线）→ 空白会话，删除避免残留
             if created_here and conversation is not None:
                 try:

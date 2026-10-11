@@ -190,7 +190,7 @@ function findStep(assistant, id) {
   return assistant.plan?.steps?.find((s) => s.id === id)
 }
 
-async function doSend(text) {
+async function doSend(text, opts = {}) {
   if (!text || busy.value) return
   error.value = ''
   messages.value.push({ role: 'user', content: text })
@@ -300,6 +300,11 @@ async function doSend(text) {
           break
         case 'cancelled':
           assistant.value.notices.push(`⏹ 已停止生成（已保留 ${ev.partial_chars} 字内容）`)
+          // 计划执行到一半被停：plan 卡片标记暂停，展示「继续执行」入口
+          if (ev.plan_run_id && assistant.value.plan) {
+            assistant.value.plan.paused = true
+            assistant.value.plan.plan_run_id = ev.plan_run_id
+          }
           break
         case 'done':
           assistant.value.latency_ms = ev.latency_ms
@@ -312,7 +317,7 @@ async function doSend(text) {
           }
           break
       }
-    }, currentConvId.value, mode.value, runId)
+    }, currentConvId.value, mode.value, runId, opts.resumePlanId ?? null)
   } catch (e) {
     error.value = e.message
   } finally {
@@ -330,6 +335,12 @@ async function stop() {
   } catch (e) {
     // 任务已结束等竞态：忽略，等流自行收尾
   }
+}
+
+// 人工接管：续跑暂停的计划——done 步骤复用产出，只补 pending 部分
+function resumePlan(planRunId) {
+  if (busy.value) return
+  doSend('继续执行暂停的计划', { resumePlanId: planRunId })
 }
 
 function send() {
@@ -408,6 +419,14 @@ onMounted(() => {
                 <div class="plan-head">
                   执行计划
                   <span v-if="m.plan.revised" class="plan-revised">已重规划 {{ m.plan.revised }} 次</span>
+                  <button
+                    v-if="m.plan.paused && m.plan.plan_run_id"
+                    class="plan-resume"
+                    title="从暂停处继续执行（已完成的步骤不重跑）"
+                    @click="resumePlan(m.plan.plan_run_id)"
+                  >
+                    ▶ 继续执行
+                  </button>
                 </div>
                 <div
                   v-for="s in m.plan.steps"
@@ -718,6 +737,22 @@ onMounted(() => {
   color: #b45309;
   margin-left: 8px;
   font-size: 11px;
+}
+
+/* 暂停计划的续跑按钮 */
+.plan-resume {
+  margin-left: auto;
+  padding: 2px 10px;
+  border: 1px solid #16a34a;
+  border-radius: 6px;
+  background: #f0fdf4;
+  color: #16a34a;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plan-resume:hover {
+  background: #dcfce7;
 }
 
 .plan-step {

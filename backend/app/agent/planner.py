@@ -188,6 +188,28 @@ def renumber_steps(steps: list[PlanStep], max_existing_id: int) -> list[PlanStep
     return steps
 
 
+def plan_from_dicts(items: list[dict], revised: int = 0) -> Plan:
+    """从持久化 JSON（to_dict 列表）还原计划——断点续跑入口。
+
+    保留各步骤的 status/result/error：done 步骤直接复用其产出，
+    execute_plan 只会执行仍为 pending 的步骤，天然实现「从断点继续」。
+    """
+    steps = [
+        PlanStep(
+            id=int(d["id"]),
+            title=str(d.get("title", "")),
+            goal=str(d.get("goal", "")),
+            tool_hint=d.get("tool_hint"),
+            depends_on=[int(x) for x in (d.get("depends_on") or [])],
+            status=str(d.get("status", "pending")),
+            result=d.get("result"),
+            error=d.get("error"),
+        )
+        for d in items
+    ]
+    return Plan(steps=steps, revised=int(revised))
+
+
 # ---------------------------------------------------------------------------
 # 三个阶段
 # ---------------------------------------------------------------------------

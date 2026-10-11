@@ -34,3 +34,25 @@ class StudyPlanItem(Base):
     content: Mapped[str | None] = mapped_column(Text)
     is_done: Mapped[bool] = mapped_column(Boolean, default=False)
     due_date: Mapped[date | None] = mapped_column(Date)
+
+
+class PlanRun(Base):
+    """Plan-and-Execute 的执行状态持久化：断点续跑 / 人工接管的基础。
+
+    plan_json 存 {"steps": [PlanStep.to_dict()], "revised": n}——每完成一步
+    即落库；暂停（用户取消/请求失败）后可携 plan_run_id 续跑，done 步骤
+    直接复用产出，只补 pending 的部分。
+    """
+    __tablename__ = "plan_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    conversation_id: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    plan_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    # running / paused / done / failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
