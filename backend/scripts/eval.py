@@ -547,10 +547,25 @@ async def run_execution_eval(db, user) -> dict:
         print(f"警告：退出时仍有 {still_pending} 个未决审批")
 
     n = len(cases)
+    # 人工干预率（来自 approval_logs 落库）：触发审批的轮次占比 + 决策分布
+    from sqlalchemy import func as _func
+
+    from app.models.approval import ApprovalLog
+
+    intervened = sum(1 for d in details if d.get("approvals"))
+    decision_rows = (
+        db.query(ApprovalLog.decision, _func.count(ApprovalLog.id))
+        .group_by(ApprovalLog.decision)
+        .all()
+    )
+    decisions = {(k or "pending"): v for k, v in decision_rows}
     metrics = {
         "queries": n,
         "passed": passed_total,
         "completion_rate": round(passed_total / n, 4) if n else 0.0,
+        "intervention_rate": round(intervened / n, 4) if n else 0.0,
+        "intervened_queries": intervened,
+        "approval_decisions": decisions,
         "skipped": False,
         "eval_usage": total_usage,
         "details": details,
@@ -559,6 +574,8 @@ async def run_execution_eval(db, user) -> dict:
     print(f"任务完成率 = {metrics['completion_rate']:.2%} ({passed_total}/{n})"
           f"  评测自身消耗 {total_usage['input_tokens']}+{total_usage['output_tokens']} tokens"
           f" / ¥{total_usage['cost_cny']:.4f}")
+    print(f"人工干预率 = {metrics['intervention_rate']:.2%}（{intervened}/{n} 轮触发审批），"
+          f"决策分布 {decisions}")
     return metrics
 
 

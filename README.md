@@ -53,7 +53,11 @@ flowchart LR
 
 - **MCP 工具层与 Agent 解耦**：业务能力封装为独立 MCP Server（stdio 子进程），Agent 通过协议调用，工具可独立复用
 - **多租户身份强制绑定**：`UserBoundTool` 包装层无论模型传入什么 `user_id`，执行前一律覆盖为当前登录用户，从协议层面杜绝越权（水平越权返回 404）
-- **写操作审批（human-in-the-loop）**：`save_study_plan` 等写工具执行前经 SSE 发出 `approval_required`，前端弹窗确认后由独立接口回传决策；超时未决按拒绝处理（fail-closed），拒绝的步骤标记 skipped 且不触发重规划，后续**不依赖**它的步骤照常执行
+- **写操作审批（human-in-the-loop，三态）**：`save_study_plan` 等写工具执行前经 SSE 发出 `approval_required`，前端弹窗提供**允许 / 拒绝 / 修改后执行**三态——修改意见作为工具结果回传模型，同一轮内调整参数后重新发起审批（不整步重跑）；超时未决与修改轮数超限均按拒绝处理（fail-closed），拒绝的步骤标记 skipped 且不触发重规划，后续**不依赖**它的步骤照常执行；每次审批请求/决策落库 `approval_logs`，**人工干预率可度量**（评测输出 20%＝1/5 轮触发审批，决策分布 approve/reject/revise/timeout）
+- **主备模型路由 + 熔断**：`LLM_ROUTES` 配置多模型路由，priority 升序主备、同级 weight 加权分流；同一路由连续失败达阈值熔断跳过、冷却后半开探测；`run_step` 每次重试前重新选路——故障切换粒度＝步骤重试，`failover` 事件实时通知前端；`build_llm` 统一经路由（闪卡生成/评测自动获得主备能力）
+- **断点续跑（执行状态持久化 + 人工接管）**：`PlanRun` 表逐事件持久化计划全状态（plan/step_end/replan 即时落库）；用户中途停止 → 计划标记 paused、消息携带续跑 id → 前端「▶ 继续执行」→ `resume_plan_id` 恢复执行，**done 步骤复用产出只补未完成部分**（中断时 running 的步骤复位重跑，写工具由幂等键兜底）；异常/断线由 finally 兜底暂停，不丢断点
+- **反思环节**：综合产出后质量自检（1-5 分 + 问题点），低于阈值且给出修订则替换答案（`reflection` 事件整体替换正文，不与已流式内容重复）；fail-open——反思失败绝不影响已产出答案
+- **限流与幂等**：每用户令牌桶限流（聊天按用户、登录按 IP 防爆破，429 带 Retry-After）；`save_study_plan` 服务端幂等——(user, 内容指纹) 窗口期去重，重试/重规划/模型重复保存返回既有计划（`deduplicated` 标记），从机制层取代提示词级护栏
 - **三模式路由（auto/direct/plan）**：auto 模式先用轻量分类判断复杂度——简单问题走单循环，复杂任务走 **Plan-and-Execute**：LLM 拆解为带依赖的结构化步骤 → **就绪批次并发执行**（`depends_on` 构成 DAG，无依赖步骤 `asyncio.gather` 并行）→ 单步失败先指数退避重试 → 重试耗尽把失败上下文喂回 LLM **重规划**（批次级，新步骤 id 平移防冲突）→ 流式综合产出；规划失败自动降级单循环，保证有回答
 - **跨步骤上下文传递 + 请求级事件去重**：每个步骤的指令注入已完成步骤的真实产出（并明确"禁止重复调用相同工具/重复保存"），从源头减少重复查询；SSE 侧按请求去重工具事件（`tool_start/tool_end` 每工具只上屏一次，`tool_records` 按 (name, input) 记录保留真实调用差异）——E2E 实测同一任务 13 条重复卡片降为 3~4 条
 - **全程流式（含规划综合）**：步骤执行中 `step_text` 逐段实时上屏，最终综合走 `astream` 异步流式逐 chunk 下发——修复真实 bug：曾误用**同步** `.stream()` 配 `async for`，`TypeError` 被静默吞掉后永远走非流式回退（综合整段吐出）；修复后 E2E 实测单次回答 **399 个 text 增量 + 185 个 step_text 增量**逐段下发
@@ -65,7 +69,7 @@ flowchart LR
 - **混合检索 + 重排**：BM25 关键词与向量语义双路召回（各取 20 候选）→ RRF 融合（免调权重）→ 交叉编码器（bge-reranker）重排取 top-k；评测显示纯向量 Hit@1 96.67% → 混合后 **100%**（r26 bad case 修复）
 - **RAG 个人知识库**：学生上传资料自动切片/向量化入库，检索按 `user_id` 过滤，Agent 回答附带溯源（文件名/切片/相似度）
 - **日期感知**：系统提示注入当前日期与教学周，Agent 可换算「今天/明天/下周一」并判断周次范围内是否上课
-- **观测性**：每条回答落库首字耗时/总耗时/Token 成本/工具调用痕迹/检索溯源/规划元数据（步骤状态、重规划次数、是否降级），学生端仪表盘与后台统计可视化
+- **观测性**：每条回答落库首字耗时/总耗时/Token 成本/工具调用痕迹/检索溯源/规划元数据（步骤状态、重规划次数、是否降级），学生端仪表盘与后台统计可视化；后台统计含审批干预分布（approve/reject/revise/timeout）
 
 ## 功能
 
@@ -142,7 +146,7 @@ Vue 3 · Element Plus · vue-router · FastAPI · SQLAlchemy 2.0 · MySQL 8 · L
 
 ## 测试
 
-后端内置 **180 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**、**会话重命名/计数/空白清理**与 API 集成，全部离线可跑（无需 API Key）：
+后端内置 **224 个 pytest 用例**，覆盖权限绑定、RAG 检索隔离、分块入库、JWT 鉴权、MCP 工具、Agent 规划执行（重试/重规划/上下文压缩/写操作审批/并行依赖调度）、Token 成本核算、跨会话记忆、**工具去重与生成中断**、**会话重命名/计数/空白清理**、**模型路由/限流/幂等/反思/断点续跑**与 API 集成，全部离线可跑（无需 API Key）：
 
 ```bash
 cd backend
@@ -163,7 +167,11 @@ python -m pytest tests/test_planner.py -v # 单文件
 | `test_context.py` | 上下文预算切分、超预算摘要压缩、旧摘要合并进新摘要、预算内不触发 |
 | `test_planner.py` | 复杂度分类（失败降级 simple）、JSON 容错与一次修复、计划步数上限、重规划带失败上下文 |
 | `test_plan_executor.py` | 执行循环：单步重试、失败重规划、重规划耗尽降级、部分成功仍综合、综合失败回退拼接、**astream 逐段流式综合**（同步 stream 误用回归防线） |
-| `test_approval.py` | **写操作审批**：注册表/超时拒绝/归属校验、门控工具拒绝时底层不执行、执行器 skipped 语义不重试不降级 |
+| `test_approval.py` | **写操作审批（三态）**：注册表/超时拒绝/归属校验、门控工具拒绝时底层不执行、**revise 意见回传不计数/超限转拒/审批门 revise 文案**、执行器 skipped 语义不重试不降级 |
+| `test_ratelimit.py` | **限流**：令牌桶容量/时间补充/容量封顶、聊天按用户隔离、未登录不耗配额、登录按 IP、配额 0 直通 |
+| `test_router.py` | **主备模型路由**：熔断状态机（开/半开/闭合/重开）、优先级选路/跳过/全熔断、同级加权分流、配置解析、usage 挂载 |
+| `test_reflection.py` | **反思**：质量分解析与夹取、低分无修订不替换、JSON 坏/LLM 失败 fail-open |
+| `test_plan_resume.py` | **断点续跑**：状态还原、running 复位 pending、续跑只执行 pending 且注入 done 产出、正常完成终态化、取消→paused、越权续跑拒绝 |
 | `test_parallel_plan.py` | **并行调度**：依赖解析（前向引用剔除保证无环）、事件门证明并发、扇出扇入 DAG、阻塞跳过、批次级重规划、id 平移 |
 | `test_usage.py` | **Token 成本核算**：OpenAI usage 与 usage_metadata 双载体提取、多调用聚合、计价公式、空 usage 不计 |
 | `test_memory.py` | **跨会话记忆**：画像节流刷新、跨会话持久与合并、LLM 失败 best-effort、阈值内零 LLM 调用 |
@@ -177,7 +185,7 @@ python -m pytest tests/test_planner.py -v # 单文件
 **真实 Key E2E**（`scripts/e2e_approval.py` / `scripts/e2e_fixes.py` / `scripts/e2e_stream_rename.py`，需 `LLM_API_KEY`）：
 - **审批 + 并发**（e2e_approval）：plan 模式 4 步任务，LLM 自主给出依赖 `[{},{},{},{1,2,3}]`（三路扇出 + 汇聚），`step_end` 顺序 `#1→#3→#2` 证明并发交织，`save_study_plan` 触发 `approval_required` → 决策 200 → 全链路 `4/4 done, 0 failed`
 - **去重 + 中断**（e2e_fixes）：同一任务 `tool_start` 仅 3~4 个（修复前 13 条含大量重复）；`run_id` + `POST cancel` → 流以 `cancelled` 收尾、重复取消 404、已生成部分落库标记「已手动停止」
-- **流式 + 会话**（e2e_stream_rename）：plan 综合逐段流式（单次回答 399 个 text 增量 + 185 个 step_text 增量，修复前整段 1 个）；侧栏计数 = assistant 条数；重命名 200 / 越权 404 / 空标题 422
+- **流式 + 会话 + 三态审批 + 断点续跑**（e2e_stream_rename）：plan 综合逐段流式（单次回答 589 个 text 增量 + 274 个 step_text 增量，修复前整段 1 个）；侧栏计数 = assistant 条数；重命名 200 / 越权 404 / 空标题 422；**revise→模型调整→二次审批→批准** 全链路；**中途取消 → plan_run_id → 续跑只补未完成步骤 → 正常收尾**
 
 ## 评测（Evaluation）
 

@@ -193,20 +193,24 @@ def plan_from_dicts(items: list[dict], revised: int = 0) -> Plan:
 
     保留各步骤的 status/result/error：done 步骤直接复用其产出，
     execute_plan 只会执行仍为 pending 的步骤，天然实现「从断点继续」。
+    中断时正在执行的步骤（running）复位为 pending——它没有产出，
+    续跑时必须重新执行（写工具由幂等键兜底，不会重复落库）。
     """
-    steps = [
-        PlanStep(
+    steps = []
+    for d in items:
+        status = str(d.get("status", "pending"))
+        if status == "running":
+            status = "pending"
+        steps.append(PlanStep(
             id=int(d["id"]),
             title=str(d.get("title", "")),
             goal=str(d.get("goal", "")),
             tool_hint=d.get("tool_hint"),
             depends_on=[int(x) for x in (d.get("depends_on") or [])],
-            status=str(d.get("status", "pending")),
+            status=status,
             result=d.get("result"),
             error=d.get("error"),
-        )
-        for d in items
-    ]
+        ))
     return Plan(steps=steps, revised=int(revised))
 
 

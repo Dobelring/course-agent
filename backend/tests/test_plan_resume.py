@@ -307,3 +307,15 @@ def test_resume_plan_rejects_other_user(client, seeded, auth_headers,
     events = _sse_data(resp.text)
     assert any(e["type"] == "error" and "不存在或无权访问" in e["message"]
                for e in events)
+
+
+def test_plan_from_dicts_resets_running_to_pending():
+    """中断时正在执行的步骤没有产出，续跑必须复位为 pending 重新执行。"""
+    plan = plan_from_dicts([
+        {"id": 1, "title": "查课表", "goal": "查", "status": "done", "result": "数据"},
+        {"id": 2, "title": "保存计划", "goal": "存", "status": "running",
+         "depends_on": [1]},
+    ])
+    assert plan.steps[0].status == "done"
+    assert plan.steps[1].status == "pending"   # running → pending（重新执行）
+    assert plan.pending == [plan.steps[1]]

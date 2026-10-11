@@ -1,4 +1,4 @@
-"""E2E 验证（真实千问 Key）：规划综合流式 + 会话重命名 + 回复计数 + 空白会话清理。
+"""E2E 验证（真实千问 Key）：流式 / 计数 / 重命名 / 三态审批（修改后执行） / 断点续跑。
 
 用法：uvicorn 启动后  python scripts/e2e_stream_rename.py [port]
 """
@@ -84,9 +84,107 @@ async def main() -> int:
             return 1
         print("[8] ✓ 重命名生效且校验/鉴权正确")
 
+        # ---------- 修复 D：三态审批（修改后执行） ----------
+        events2: list[dict] = []
+        approvals_seen: list[str] = []
+        async with client.stream(
+            "POST", "/api/chat", headers=headers,
+            json={"message": "结合我的成绩，制定一份下周学习计划并保存", "mode": "plan"},
+        ) as resp:
+            assert resp.status_code == 200
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                events2.append(ev)
+                if ev["type"] == "approval_required":
+                    approvals_seen.append(ev["approval_id"])
+                    # 第一次给修改意见（revise），之后批准
+                    action = "revise" if len(approvals_seen) == 1 else "approve"
+                    feedback = "任务条目请拆得更细，每条一句话" if action == "revise" else None
+                    ar = await client.post(
+                        f"/api/chat/approvals/{ev['approval_id']}",
+                        headers=headers, json={"action": action, "feedback": feedback})
+                    print(f"[10] approval_required #{len(approvals_seen)} → {action} ({ar.status_code})")
+        reflects = [e for e in events2 if e["type"] == "reflection"]
+        done2 = next((e for e in events2 if e["type"] == "done"), None)
+        revise_resolved = [e for e in events2 if e["type"] == "approval_resolved"
+                           and e.get("reason") == "用户要求修改后重新提交"]
+        print(f"[11] 审批次数 {len(approvals_seen)}，revise 生效 {bool(revise_resolved)}，"
+              f"反思事件 {len(reflects)}（quality={reflects[0]['quality'] if reflects else 'N/A'}），"
+              f"done={bool(done2)}")
+        if len(approvals_seen) < 2 or not revise_resolved or not done2:
+            print("    ✗ 三态审批（revise→approve）链路未走通")
+            return 1
+        print("[12] ✓ 修改后执行链路走通：意见回传模型 → 调整参数重新审批 → 批准落库")
+
+        # ---------- 修复 E：断点续跑 ----------
+        import uuid as _uuid
+        cancel_run = str(_uuid.uuid4())
+        events3: list[dict] = []
+        got_step = asyncio.Event()
+
+        async def read_plan_stream():
+            async with client.stream(
+                "POST", "/api/chat", headers=headers,
+                json={"message": "详细分析我所有科目的学习情况并给出完整建议",
+                      "mode": "plan", "run_id": cancel_run},
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    ev = json.loads(line[6:])
+                    events3.append(ev)
+                    if ev["type"] == "step_start":
+                        got_step.set()
+                    if ev["type"] in ("cancelled", "done", "error"):
+                        return
+
+        reader = asyncio.create_task(read_plan_stream())
+        try:
+            await asyncio.wait_for(got_step.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            print("    ✗ 60s 未进入步骤执行")
+            reader.cancel()
+            return 1
+        cr = await client.post("/api/chat/cancel", headers=headers,
+                               json={"run_id": cancel_run})
+        await asyncio.wait_for(reader, timeout=30)
+        cancelled = next((e for e in events3 if e["type"] == "cancelled"), None)
+        plan_run_id = (cancelled or {}).get("plan_run_id")
+        print(f"[13] cancel → {cr.status_code}，plan_run_id={plan_run_id}")
+        if not plan_run_id:
+            print("    ✗ cancelled 事件未携带 plan_run_id")
+            return 1
+
+        events4: list[dict] = []
+        async with client.stream(
+            "POST", "/api/chat", headers=headers,
+            json={"message": "继续执行暂停的计划", "mode": "plan",
+                  "resume_plan_id": plan_run_id},
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    events4.append(json.loads(line[6:]))
+        mode4 = next((e for e in events4 if e["type"] == "mode"), None)
+        done4 = next((e for e in events4 if e["type"] == "done"), None)
+        step_starts = [e for e in events4 if e["type"] == "step_start"]
+        print(f"[14] 续跑：mode={mode4 and mode4.get('reason')}，"
+              f"step_start={len(step_starts)}，done={bool(done4 and done4.get('plan'))}")
+        if not (mode4 and "续跑" in (mode4.get("reason") or "")) or not done4:
+            print("    ✗ 续跑未走通")
+            return 1
+        print("[15] ✓ 断点续跑走通：暂停 → 恢复 → 只补未完成步骤 → 正常收尾")
+
         # ---------- 清理：删掉测试会话 ----------
         await client.delete(f"/api/conversations/{cid}", headers=headers)
-        print("[9] ✓ 测试会话已清理")
+        if done2 and done2.get("conversation_id"):
+            await client.delete(f"/api/conversations/{done2['conversation_id']}",
+                                headers=headers)
+        if done4 and done4.get("conversation_id"):
+            await client.delete(f"/api/conversations/{done4['conversation_id']}",
+                                headers=headers)
+        print("[16] ✓ 测试会话已清理")
         return 0
 
 
