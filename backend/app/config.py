@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     # 工具幂等：save_study_plan 按 (user, 内容指纹) 在窗口期内去重，窗口内重复保存返回既有计划
     tool_idempotency_window_s: int = 600
 
+    # MCP 工具列表缓存 TTL（秒）：spawn+列举实测 ~1.5s/请求，缓存后降为一次性成本；0 = 关闭
+    mcp_tools_cache_ttl: int = 300
+
     # 限流（每分钟）：聊天按用户、登录按客户端 IP；0 = 关闭（测试/评测脚本）
     rate_limit_chat_per_min: int = 10
     rate_limit_login_per_min: int = 10

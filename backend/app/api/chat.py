@@ -24,7 +24,6 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from loguru import logger
 from pydantic import BaseModel
 
@@ -36,7 +35,7 @@ from app.agent.approval import (
     gate_write_tools,
 )
 from app.agent.context import ContextPlan, build_context, split_history
-from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_config, pretty_tool_name
+from app.agent.engine import bind_user, build_agent, build_llm, get_tools_cached, pretty_tool_name
 from app.agent.reflection import reflect
 from app.agent.router import get_router
 from app.agent.planner import (
@@ -237,9 +236,9 @@ async def chat(payload: ChatRequest,
                 db.refresh(conversation)
                 created_here = True
 
-            # 每次会话拉起独立 MCP 服务器子进程（stdio），工具调用后自动清理
-            client = MultiServerMCPClient(mcp_client_config())
-            raw_tools = await client.get_tools()
+            # 每请求拉起独立 MCP 服务器子进程改为进程级缓存（单飞+TTL）：
+            # spawn+列举实测 ~1.5s 全在首字之前，工具 schema 变化极低频
+            raw_tools = await get_tools_cached()
             tool_names = {t.name for t in raw_tools}
             pretty_names = sorted({pretty_tool_name(n) for n in tool_names})
             tools = bind_user(raw_tools, current_user.id)

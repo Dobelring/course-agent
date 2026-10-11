@@ -1,17 +1,64 @@
 """Agent 编排：连接 MCP 工具 + 强制绑定登录用户 + OpenAI 兼容 LLM（默认千问）。"""
+import asyncio
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
 from langchain_core.tools import BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 
 from app.config import settings
 from app.models.user import User
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+# ---------------------------------------------------------------------------
+# MCP 工具列表缓存：spawn 子进程 + 列举工具实测 ~1.5s，全部落在首字之前。
+# 工具 schema 变化频率极低，进程级缓存（单飞 + TTL）把它砍成一次性成本。
+# ---------------------------------------------------------------------------
+
+_tools_cache: list[BaseTool] | None = None
+_tools_cached_at: float = 0.0
+_tools_lock = None  # 惰性创建（进入事件循环后再建，避免跨循环绑定）
+
+
+async def get_tools_cached() -> list[BaseTool]:
+    """进程级 MCP 工具列表缓存（单飞 + TTL）。
+
+    - TTL 内直接复用（`mcp_tools_cache_ttl` 秒，0 = 关闭恢复每请求拉取）
+    - 并发 miss 用 asyncio.Lock 单飞，避免惊群拉起多个子进程
+    - 注意：工具**调用**仍会新建会话（当前 langchain-mcp-adapters 已移除
+      上下文管理器支持，见 design.md 已知局限），缓存只覆盖列表列举
+    """
+    global _tools_cache, _tools_cached_at, _tools_lock
+    ttl = settings.mcp_tools_cache_ttl
+
+    def _fresh() -> bool:
+        # ttl<=0 表示关闭缓存（每请求拉取）；其余按时间窗判断
+        return _tools_cache is not None and ttl > 0 and time.monotonic() - _tools_cached_at <= ttl
+
+    if _fresh():
+        return _tools_cache
+    if _tools_lock is None:
+        _tools_lock = asyncio.Lock()
+    async with _tools_lock:
+        if _fresh():
+            return _tools_cache
+        client = MultiServerMCPClient(mcp_client_config())
+        _tools_cache = await client.get_tools()
+        _tools_cached_at = time.monotonic()
+    return _tools_cache
+
+
+def reset_tools_cache() -> None:
+    """清空工具缓存（测试/配置变更后用）。"""
+    global _tools_cache, _tools_cached_at
+    _tools_cache = None
+    _tools_cached_at = 0.0
 
 
 class UserBoundTool(BaseTool):
