@@ -37,3 +37,6 @@ frontend/dist/
 *.swp
 .DS_Store
 Thumbs.db
+
+# ===== 文档/简历/设计文档（不入库，本地保留）=====
+docs/
