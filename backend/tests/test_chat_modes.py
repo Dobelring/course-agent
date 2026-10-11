@@ -173,3 +173,42 @@ def test_context_compression_emits_event_and_persists_summary(
     # 摘要进了系统提示（extra_system 由 build_agent 假实现接收——校验 LLM 侧无从谈起，
     # 这里断言 build_context 的 prompt 确实包含旧摘要）
     assert any("很久以前" in p for p in fake_agent_env.prompts)
+
+
+def test_reflection_revises_answer_and_persists(client, seeded, auth_headers,
+                                                fake_agent_env, monkeypatch):
+    """低质量自检 → reflection 事件带修订 → 正文替换 + 落库采用修订稿。"""
+    from fakes import _sse_data
+
+    fake_agent_env.reflect_quality = 2
+    fake_agent_env.reflect_revised = "反思后的修订答案"
+    resp = client.post("/api/chat",
+                       json={"message": "分析课表", "mode": "plan"},
+                       headers=auth_headers("student1"))
+    events = _sse_data(resp.text)
+    refl = next(e for e in events if e["type"] == "reflection")
+    assert refl["quality"] == 2 and refl["revised"] == "反思后的修订答案"
+
+    done = next(e for e in events if e["type"] == "done")
+    detail = client.get(f"/api/conversations/{done['conversation_id']}",
+                        headers=auth_headers("student1")).json()
+    assistant = [m for m in detail["messages"] if m["role"] == "assistant"][0]
+    assert assistant["content"] == "反思后的修订答案"
+
+
+def test_reflection_high_quality_keeps_streamed_answer(client, seeded, auth_headers,
+                                                       fake_agent_env):
+    """质量达标 → reflection 仅提示，答案保持综合原文。"""
+    from fakes import _sse_data
+
+    resp = client.post("/api/chat",
+                       json={"message": "分析课表", "mode": "plan"},
+                       headers=auth_headers("student1"))
+    events = _sse_data(resp.text)
+    refl = next(e for e in events if e["type"] == "reflection")
+    assert refl["quality"] == 5 and refl["revised"] is None
+    done = next(e for e in events if e["type"] == "done")
+    detail = client.get(f"/api/conversations/{done['conversation_id']}",
+                        headers=auth_headers("student1")).json()
+    assistant = [m for m in detail["messages"] if m["role"] == "assistant"][0]
+    assert assistant["content"] == "综合后的答案"

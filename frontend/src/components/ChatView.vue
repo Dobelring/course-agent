@@ -277,6 +277,12 @@ async function doSend(text) {
         case 'failover':
           assistant.value.notices.push(`⚠ 模型调用失败，已切换备用路由：${ev.from} → ${ev.to}`)
           break
+        case 'reflection':
+          assistant.value.notices.push(
+            `🔍 质量自检 ${ev.quality}/5${ev.issues?.length ? '：' + ev.issues.join('；') : ''}`
+          )
+          if (ev.revised) assistant.value.content = ev.revised
+          break
         case 'fallback':
           assistant.value.notices.push(`↩ 已降级为直接回答：${ev.reason}`)
           break

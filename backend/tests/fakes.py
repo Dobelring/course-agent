@@ -13,11 +13,17 @@ def _sse_data(resp_text: str) -> list[dict]:
 
 
 class FakeLLM:
-    """按提示词类型返回预设输出，供分类/规划/综合共用。"""
+    """按提示词类型返回预设输出，供分类/规划/综合/反思共用。
 
-    def __init__(self, *, complex_: bool = True, summary: str = "历史摘要X"):
+    reflect_quality/reflect_revised 可在用例中覆写以模拟低质量自检。
+    """
+
+    def __init__(self, *, complex_: bool = True, summary: str = "历史摘要X",
+                 reflect_quality: int = 5, reflect_revised: str = ""):
         self.complex_ = complex_
         self.summary = summary
+        self.reflect_quality = reflect_quality
+        self.reflect_revised = reflect_revised
         self.prompts: list[str] = []
 
     async def ainvoke(self, messages, **kw):
@@ -35,6 +41,11 @@ class FakeLLM:
             return SimpleNamespace(content=self.summary)
         if "综合器" in prompt:
             return SimpleNamespace(content="综合后的答案")
+        if "质量审查器" in prompt:
+            return SimpleNamespace(content=json.dumps({
+                "quality": self.reflect_quality, "issues": ["测试问题点"],
+                "revised": self.reflect_revised,
+            }))
         return SimpleNamespace(content="默认回复")
 
 

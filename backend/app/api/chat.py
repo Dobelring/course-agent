@@ -37,6 +37,7 @@ from app.agent.approval import (
 )
 from app.agent.context import ContextPlan, build_context, split_history
 from app.agent.engine import bind_user, build_agent, build_llm, mcp_client_config, pretty_tool_name
+from app.agent.reflection import reflect
 from app.agent.router import get_router
 from app.agent.planner import Plan, PlanStep, classify_complexity, create_plan
 from app.agent.plan_executor import ExecutionResult, execute_plan
@@ -544,10 +545,31 @@ async def chat(payload: ChatRequest,
                         # 综合走了非流式回退 → 整段补发
                         await sink({"type": "text", "delta": executor.answer})
 
+                    # ---------- 反思：综合后自检，低于阈值且给出修订则替换 ----------
+                    if executor.answer:
+                        failed_report = "\n".join(
+                            f"- {s.title}：{s.error or '未执行'}"
+                            for s in executor.plan.steps
+                            if s.status in ("failed", "skipped", "pending")
+                        ) or "（无）"
+                        refl = await reflect(
+                            llm, payload.message, executor.answer, failed_report,
+                            min_quality=settings.agent_reflect_min_quality,
+                        )
+                        await sink({
+                            "type": "reflection",
+                            "quality": refl.quality,
+                            "issues": refl.issues,
+                            "revised": refl.revised or None,
+                        })
+                        if refl.revised:
+                            executor.answer = refl.revised  # 供 final_answer / 落库
+
                 if mode_used == "direct":
                     await run_direct()
                 return {"mode_used": mode_used, "plan_meta": plan_meta,
-                        "degraded": degraded}
+                        "degraded": degraded,
+                        "final_answer": executor.answer if executor else None}
 
             # ---------- 启动后台任务 ----------
             if mode == "plan":
@@ -608,7 +630,8 @@ async def chat(payload: ChatRequest,
                 )
                 return
 
-            answer = "".join(collected_text)
+            # 反思修订的答案不走 text 增量（避免与已流式内容重复），此处优先采用
+            answer = (result.get("final_answer") if result else None) or "".join(collected_text)
             latency = int((time.perf_counter() - started_at) * 1000)
             usage_dict = usage.to_dict()
             # 保存对话历史
