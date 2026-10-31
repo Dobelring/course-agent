@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -94,7 +94,7 @@ async def maybe_refresh_profile(
         new_profile = await refresh_profile(llm, row.profile, messages)
         if new_profile:
             row.profile = new_profile
-            row.updated_at = datetime.utcnow()
+            row.updated_at = datetime.now(timezone.utc)
         row.hits = 0
         db.commit()
         logger.info("用户画像已刷新 user_id=%s chars=%s", user_id, len(row.profile))

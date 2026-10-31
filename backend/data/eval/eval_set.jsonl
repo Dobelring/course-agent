@@ -106,3 +106,33 @@
 {"id": "e8", "type": "execution", "mode": "direct", "query": "有没有已经逾期还没交的作业？", "must_contain": ["神经网络"], "tag": "业务查询"}
 {"id": "e9", "type": "execution", "mode": "direct", "query": "我上传的资料里，英语作文有哪些高分句型可以背？", "must_contain": ["句型"], "tag": "RAG问答"}
 {"id": "e10", "type": "execution", "mode": "plan", "query": "参考我的成绩，给数据结构制定一份期末冲刺计划并保存", "check": "plan_saved", "min_items": 3, "tag": "计划保存"}
+{"id": "r51", "type": "retrieval", "query": "try 里的 else 和 finally 分别在什么时候执行", "expected_doc": "Python异常处理与健壮性.md", "tag": "程序设计"}
+{"id": "r52", "type": "retrieval", "query": "不管出不出错都保证执行一段清理代码，该写在哪里", "expected_doc": "Python异常处理与健壮性.md", "difficulty": "hard", "tag": "程序设计"}
+{"id": "r53", "type": "retrieval", "query": "生成器和普通函数有什么区别，yield 是干嘛的", "expected_doc": "Python生成器与迭代器.md", "tag": "程序设计"}
+{"id": "r54", "type": "retrieval", "query": "处理几个 G 的大文本文件怎么避免内存被吃满", "expected_doc": "Python生成器与迭代器.md", "difficulty": "hard", "tag": "程序设计"}
+{"id": "r55", "type": "retrieval", "query": "怎么把字典保存成 JSON 文件再读回来", "expected_doc": "Python文件与模块组织.md", "tag": "程序设计"}
+{"id": "r56", "type": "retrieval", "query": "Python 文件怎么判断自己是被导入还是被直接运行", "expected_doc": "Python文件与模块组织.md", "difficulty": "hard", "tag": "程序设计"}
+{"id": "r57", "type": "retrieval", "query": "主定理是解决什么问题的", "expected_doc": "数据结构算法分析基础.md", "tag": "数据结构"}
+{"id": "r58", "type": "retrieval", "query": "动态数组为什么扩容之后每次插入平均还是很快", "expected_doc": "数据结构算法分析基础.md", "difficulty": "hard", "tag": "数据结构"}
+{"id": "r59", "type": "retrieval", "query": "KMP 算法为什么比暴力匹配快", "expected_doc": "数据结构字符串与模式匹配.md", "tag": "数据结构"}
+{"id": "r60", "type": "retrieval", "query": "想快速判断一堆单词里有没有以某个串打头的，用什么结构", "expected_doc": "数据结构字符串与模式匹配.md", "difficulty": "hard", "tag": "数据结构"}
+{"id": "r61", "type": "retrieval", "query": "并查集是怎么做到查找几乎不花时间的", "expected_doc": "数据结构并查集与堆专题.md", "tag": "数据结构"}
+{"id": "r62", "type": "retrieval", "query": "怎么实现一个总能马上拿到最紧急任务的调度器", "expected_doc": "数据结构并查集与堆专题.md", "difficulty": "hard", "tag": "数据结构"}
+{"id": "r63", "type": "retrieval", "query": "分部积分公式是什么，什么情况下用它", "expected_doc": "高等数学积分学专题.md", "tag": "高等数学"}
+{"id": "r64", "type": "retrieval", "query": "积分上下限是无穷的时候怎么判断积分有没有意义", "expected_doc": "高等数学积分学专题.md", "difficulty": "hard", "tag": "高等数学"}
+{"id": "r65", "type": "retrieval", "query": "级数收敛的必要条件是什么", "expected_doc": "高等数学级数判别法专题.md", "tag": "高等数学"}
+{"id": "r66", "type": "retrieval", "query": "正负交替的级数在什么条件下收敛", "expected_doc": "高等数学级数判别法专题.md", "difficulty": "hard", "tag": "高等数学"}
+{"id": "r67", "type": "retrieval", "query": "二元函数可微和偏导数存在是什么关系", "expected_doc": "高等数学多元函数微积分.md", "tag": "高等数学"}
+{"id": "r68", "type": "retrieval", "query": "求函数在某个约束条件下的极值用什么方法", "expected_doc": "高等数学多元函数微积分.md", "difficulty": "hard", "tag": "高等数学"}
+{"id": "r69", "type": "retrieval", "query": "逻辑回归是怎么做分类的", "expected_doc": "机器学习经典算法专题.md", "tag": "机器学习"}
+{"id": "r70", "type": "retrieval", "query": "想把高维数据降到二维画散点图该用什么方法", "expected_doc": "机器学习经典算法专题.md", "difficulty": "hard", "tag": "机器学习"}
+{"id": "r71", "type": "retrieval", "query": "什么是思维链提示，怎么让模型把推理步骤写出来", "expected_doc": "提示工程与上下文学习.md", "tag": "机器学习"}
+{"id": "r72", "type": "retrieval", "query": "模型做数学题总是跳步直接给答案，提示词上有什么办法", "expected_doc": "提示工程与上下文学习.md", "difficulty": "hard", "tag": "机器学习"}
+{"id": "r73", "type": "retrieval", "query": "Q-learning 的更新公式长什么样", "expected_doc": "强化学习基础.md", "tag": "机器学习"}
+{"id": "r74", "type": "retrieval", "query": "智能体一直选当前看起来最优的动作会有什么问题，怎么解决", "expected_doc": "强化学习基础.md", "difficulty": "hard", "tag": "机器学习"}
+{"id": "r75", "type": "retrieval", "query": "听力的选项预读应该怎么做", "expected_doc": "四六级听力突破指南.md", "tag": "英语学习"}
+{"id": "r76", "type": "retrieval", "query": "听力录音里放的词和选项里的词总是不一样怎么办", "expected_doc": "四六级听力突破指南.md", "difficulty": "hard", "tag": "英语学习"}
+{"id": "r77", "type": "retrieval", "query": "仔细阅读的干扰项都有哪些套路", "expected_doc": "四六级阅读理解技巧.md", "tag": "英语学习"}
+{"id": "r78", "type": "retrieval", "query": "段落匹配题应该先读题目还是先读文章", "expected_doc": "四六级阅读理解技巧.md", "difficulty": "hard", "tag": "英语学习"}
+{"id": "r79", "type": "retrieval", "query": "怎么用词根词缀举一反三地背单词", "expected_doc": "英语词根词缀与词汇记忆.md", "tag": "英语学习"}
+{"id": "r80", "type": "retrieval", "query": "单词背了过几天就忘，复习应该怎么安排", "expected_doc": "英语词根词缀与词汇记忆.md", "difficulty": "hard", "tag": "英语学习"}
