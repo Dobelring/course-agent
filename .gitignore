@@ -38,5 +38,7 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 
-# ===== 文档/简历/设计文档（不入库，本地保留）=====
-docs/
+# ===== 文档/简历/设计文档（不入库，本地保留）——仅 screenshots 随 README 入库 =====
+docs/*
+!docs/screenshots/
+!docs/screenshots/**
